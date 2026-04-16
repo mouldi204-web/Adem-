@@ -8,11 +8,11 @@ from flask import Flask
 # =========================
 # TELEGRAM CONFIG
 # =========================
-TOKEN = "PUT_YOUR_TOKEN_HERE"
+TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 
 CHAT_IDS = [
-    "YOUR_PRIVATE_CHAT_ID",
-    "YOUR_CHANNEL_CHAT_ID"  # -100xxxxxxxx
+    "5067771509",
+    "-1003692815602"  # -100xxxxxxxx
 ]
 
 def send(msg):
