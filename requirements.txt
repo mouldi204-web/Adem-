@@ -1,6 +1,5 @@
+requests
 pandas
 numpy
-requests
 flask
-scikit-learn
-joblib
+waitress
