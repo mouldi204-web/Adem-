@@ -35,8 +35,8 @@ BLACKLIST = ["BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT"]
 # =========================
 # TELEGRAM
 # =========================
-TELEGRAM_TOKEN = "YOUR_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+TELEGRAM_TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
+CHAT_ID = "5067771509"
 
 def send(msg):
     try:
