@@ -1,12 +1,12 @@
+import time
+import requests
 import pandas as pd
 import numpy as np
-import requests
-import time
-import sqlite3
-import threading
-from flask import Flask
 import joblib
 import os
+import threading
+from flask import Flask
+from datetime import datetime
 
 # =========================
 # KEEP ALIVE SERVER
@@ -15,347 +15,308 @@ app = Flask("")
 
 @app.route("/")
 def home():
-    return "Bot is alive"
+    return "BOT RUNNING"
 
-def run_server():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = threading.Thread(target=run_server)
-    t.start()
-
-keep_alive()
+threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
 # =========================
 # CONFIG
 # =========================
-BASE_URL = "https://api.kucoin.com"
+BASE = "https://api.kucoin.com"
 
-BALANCE = 500
-TRADE_AMOUNT = 100
-MAX_TRADES = 5
-
+TRADE_SIZE = 100
 open_trades = []
+
+daily_profit = 0
+daily_trades = 0
+
+BLACKLIST = ["BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT"]
 
 # =========================
 # TELEGRAM
 # =========================
-TELEGRAM_TOKEN = "PUT_TOKEN"
-CHAT_ID = "PUT_CHAT_ID"
+TELEGRAM_TOKEN = "YOUR_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
 
 def send(msg):
-    print(msg)
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg}
-        )
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except:
         pass
 
 # =========================
-# DATABASE (SQLite)
+# AI MODEL
 # =========================
-conn = sqlite3.connect("trades.db", check_same_thread=False)
-cursor = conn.cursor()
+model = joblib.load("model.pkl") if os.path.exists("model.pkl") else None
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol TEXT,
-    entry REAL,
-    amount REAL,
-    status TEXT,
-    profit REAL DEFAULT 0
-)
-""")
-conn.commit()
-
-def save_trade(symbol, entry, amount):
-    cursor.execute("""
-    INSERT INTO trades (symbol, entry, amount, status)
-    VALUES (?, ?, ?, 'OPEN')
-    """, (symbol, entry, amount))
-    conn.commit()
-
-def close_trade_db(symbol, profit):
-    cursor.execute("""
-    UPDATE trades
-    SET status='CLOSED', profit=?
-    WHERE symbol=? AND status='OPEN'
-    """, (profit, symbol))
-    conn.commit()
-
-def load_trades():
-    cursor.execute("SELECT symbol, entry, amount FROM trades WHERE status='OPEN'")
-    return cursor.fetchall()
-
-# =========================
-# LOAD MODEL (ML)
-# =========================
-# model.pkl يجب وضعه بجانب main.py
-if os.path.exists("model.pkl"):
-    model = joblib.load("model.pkl")
-else:
-    model = None
+def ai_prob(features):
+    if model is None:
+        return 0.5
+    return model.predict_proba([features])[0][1]
 
 # =========================
 # DATA
 # =========================
 def get_symbols():
-    data = requests.get(BASE_URL + "/api/v1/symbols").json()['data']
-    return [s['symbol'] for s in data if s['quoteCurrency'] == 'USDT'][:20]
+    data = requests.get(BASE + "/api/v1/symbols").json()['data']
+    return [s['symbol'] for s in data if s['quoteCurrency']=='USDT'][:1000]
 
-def get_klines(symbol):
-    url = BASE_URL + f"/api/v1/market/candles?type=5min&symbol={symbol}"
-    data = requests.get(url).json()['data']
 
-    df = pd.DataFrame(data, columns=[
-        'time','open','close','high','low','volume','turnover'
-    ])
+def klines(symbol):
+    url = BASE + f"/api/v1/market/candles?type=5min&symbol={symbol}"
+    d = requests.get(url).json()['data']
 
+    df = pd.DataFrame(d, columns=['t','o','c','h','l','v','x'])
     df = df.iloc[::-1]
 
-    for col in ['open','close','high','low','volume']:
-        df[col] = df[col].astype(float)
+    for c in ['o','c','h','l','v']:
+        df[c] = df[c].astype(float)
 
     return df
-
-# =========================
-# FEATURES (ML)
-# =========================
-def make_features(df):
-    df['return'] = df['close'].pct_change()
-    df['ema10'] = df['close'].ewm(span=10).mean()
-    df['ema50'] = df['close'].ewm(span=50).mean()
-    df['vol_ma'] = df['volume'].rolling(20).mean()
-
-    last = df.iloc[-1]
-
-    return np.array([[
-        last['return'],
-        last['ema10'],
-        last['ema50'],
-        last['volume'],
-        last['vol_ma']
-    ]])
-
-def predict(df):
-    if model is None:
-        return 0.5  # fallback
-
-    X = make_features(df)
-    return model.predict_proba(X)[0][1]
 
 # =========================
 # INDICATORS
 # =========================
-def analyze(df):
-    df['ema20'] = df['close'].ewm(span=20).mean()
-    df['ema50'] = df['close'].ewm(span=50).mean()
+def indicators(df):
 
-    df['vol_ma'] = df['volume'].rolling(20).mean()
+    df['ema9'] = df['c'].ewm(9).mean()
+    df['ema21'] = df['c'].ewm(21).mean()
+    df['ema50'] = df['c'].ewm(50).mean()
 
-    df['bb_mid'] = df['close'].rolling(20).mean()
-    df['bb_std'] = df['close'].rolling(20).std()
-    df['bb_width'] = df['bb_std'] * 2
-
-    df['atr'] = (df['high'] - df['low']).rolling(14).mean()
+    df['vol_ma'] = df['v'].rolling(20).mean()
 
     return df
 
 # =========================
-# SCORE
+# PRE FILTER
 # =========================
-def get_score(df):
+def pre_filter(df):
 
     last = df.iloc[-1]
 
-    score = 0
+    ema9 = df['c'].ewm(9).mean().iloc[-1]
+    ema21 = df['c'].ewm(21).mean().iloc[-1]
+    ema50 = df['c'].ewm(50).mean().iloc[-1]
 
-    if last['volume'] > 2 * last['vol_ma']:
-        score += 3
+    vol_ma = df['v'].rolling(20).mean().iloc[-1]
+    resistance = df['h'].rolling(20).max().iloc[-2]
 
-    if last['close'] > df['high'].rolling(20).max().iloc[-2]:
-        score += 3
-
-    if last['close'] > last['ema50']:
-        score += 2
-
-    if df['atr'].iloc[-1] > df['atr'].rolling(20).mean().iloc[-1]:
-        score += 2
-
-    return score
+    return all([
+        last['v'] > 1.8 * vol_ma,
+        last['c'] > resistance,
+        ema9 > ema21,
+        ema21 > ema50
+    ])
 
 # =========================
-# TRAILING AI EXIT
+# AI + TECH SCORE
 # =========================
-def ai_exit(df, trade):
+def coin_rank(df):
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
 
-    score = 0
+    features = [
+        last['c'],
+        last['v'],
+        df['v'].rolling(20).mean().iloc[-1],
+        last['ema9'],
+        last['ema50']
+    ]
 
-    if last['close'] < last['ema20']:
-        score += 3
+    prob = ai_prob(features)
 
-    if last['volume'] < df['volume'].rolling(10).mean().iloc[-1]:
-        score += 2
+    tech = 0
 
-    if prev['close'] > last['close']:
-        score += 2
+    if last['v'] > 2 * df['v'].rolling(20).mean().iloc[-1]:
+        tech += 25
 
-    return score
+    if last['ema9'] > last['ema21']:
+        tech += 20
+
+    if last['ema21'] > last['ema50']:
+        tech += 20
+
+    if last['c'] > df['h'].rolling(20).max().iloc[-2]:
+        tech += 25
+
+    ai = int(prob * 30)
+
+    return min(tech + ai, 100), prob
 
 # =========================
-# TRADE FUNCTIONS
+# TRAILING STOP
+# =========================
+def trailing_stop(trade, price):
+
+    entry = trade["entry"]
+
+    profit = (price - entry) / entry
+
+    if profit < 0.01:
+        return None
+
+    if "high" not in trade:
+        trade["high"] = price
+
+    if price > trade["high"]:
+        trade["high"] = price
+
+    return trade["high"] * 0.98
+
+# =========================
+# OPEN TRADE
 # =========================
 def open_trade(symbol, price):
-    global BALANCE
 
-    if len(open_trades) >= MAX_TRADES:
-        return
+    global daily_trades
 
-    trade = {
+    open_trades.append({
         "symbol": symbol,
-        "entry": price,
-        "amount": TRADE_AMOUNT,
-        "highest": price,
-        "trail": False,
-        "partial": False,
-        "sl": price * 0.98
-    }
+        "entry": price
+    })
 
-    open_trades.append(trade)
-    save_trade(symbol, price, TRADE_AMOUNT)
+    daily_trades += 1
 
-    BALANCE -= TRADE_AMOUNT
-
-    send(f"🟢 OPEN {symbol} @ {price}\nBalance: {BALANCE}")
+    send(f"🚀 OPEN TRADE\n{symbol}\nEntry: {price}")
 
 # =========================
-# CHECK TRADES (AI + TRAILING)
+# CLOSE TRADE
+# =========================
+def close_trade(trade, price):
+
+    global daily_profit
+
+    profit = (price - trade["entry"]) * TRADE_SIZE
+
+    daily_profit += profit
+
+    send(
+        f"📉 CLOSE TRADE\n{trade['symbol']}\n"
+        f"Exit: {price}\nProfit: {profit:.2f}$"
+    )
+
+# =========================
+# CHECK TRADES
 # =========================
 def check_trades():
 
-    global BALANCE
+    for t in open_trades[:]:
 
-    for trade in open_trades[:]:
+        df = indicators(klines(t["symbol"]))
+        price = df['c'].iloc[-1]
 
-        df = get_klines(trade['symbol'])
-        df = analyze(df)
+        stop = trailing_stop(t, price)
 
-        price = df['close'].iloc[-1]
-        entry = trade['entry']
-        atr = df['atr'].iloc[-1]
+        if stop and price < stop:
 
-        # ===== Break-even =====
-        if price >= entry * 1.025:
-            trade['sl'] = entry
-
-        # ===== Partial TP =====
-        if not trade['partial'] and price >= entry * 1.04:
-            profit = trade['amount'] * 0.04 * 0.5
-            BALANCE += profit
-            trade['amount'] *= 0.5
-            trade['partial'] = True
-            send(f"💸 Partial TP {trade['symbol']} +{profit:.2f}$")
-
-        # ===== Trailing =====
-        if price >= entry * 1.03:
-            trade['trail'] = True
-
-        if trade['trail']:
-            if price > trade['highest']:
-                trade['highest'] = price
-
-            trail_stop = trade['highest'] - atr * 1.5
-
-            if price <= trail_stop:
-                profit = trade['amount'] * ((price - entry) / entry)
-
-                BALANCE += trade['amount'] + profit
-
-                close_trade_db(trade['symbol'], profit)
-                open_trades.remove(trade)
-
-                send(f"🏁 EXIT {trade['symbol']} PROFIT {profit:.2f}$")
-                continue
-
-        # ===== AI EXIT =====
-        if ai_exit(df, trade) >= 5:
-            profit = trade['amount'] * ((price - entry) / entry)
-
-            BALANCE += trade['amount'] + profit
-
-            close_trade_db(trade['symbol'], profit)
-            open_trades.remove(trade)
-
-            send(f"🤖 AI EXIT {trade['symbol']} {profit:.2f}$")
-            continue
-
-        # ===== Stop Loss =====
-        if price <= trade['sl']:
-            loss = trade['amount'] * 0.02
-
-            BALANCE += trade['amount'] - loss
-
-            close_trade_db(trade['symbol'], -loss)
-            open_trades.remove(trade)
-
-            send(f"❌ SL {trade['symbol']} -{loss}$")
+            close_trade(t, price)
+            open_trades.remove(t)
 
 # =========================
-# BOT LOOP
+# SIGNAL ALERT
+# =========================
+def signal_alert(symbol, score, prob):
+
+    send(
+        f"🔥 SIGNAL DETECTED\n"
+        f"{symbol}\n"
+        f"Score: {score}/100\n"
+        f"Prob: {prob:.2f}"
+    )
+
+# =========================
+# SCANNER
+# =========================
+def scan_coin(symbol):
+
+    df = indicators(klines(symbol))
+
+    if not pre_filter(df):
+        return None
+
+    score, prob = coin_rank(df)
+
+    if score >= 75 and prob >= 0.85:
+
+        signal_alert(symbol, score, prob)
+
+        return {
+            "symbol": symbol,
+            "score": score,
+            "prob": prob
+        }
+
+    return None
+
+def scanner():
+
+    symbols = get_symbols()
+    results = []
+
+    for s in symbols:
+
+        try:
+            r = scan_coin(s)
+            if r:
+                results.append(r)
+        except:
+            continue
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    return results
+
+# =========================
+# DAILY REPORT
+# =========================
+def daily_report():
+
+    send(
+        f"📊 DAILY REPORT\n"
+        f"Trades: {daily_trades}\n"
+        f"Profit: {daily_profit:.2f}$"
+    )
+
+# =========================
+# MAIN LOOP
 # =========================
 def run():
 
-    global BALANCE
+    global daily_profit, daily_trades
 
-    send("🚀 FULL AI BOT STARTED")
+    print("🚀 FINAL BOT WITH TELEGRAM STARTED")
 
-    # restore trades
-    restored = load_trades()
-
-    for t in restored:
-        open_trades.append({
-            "symbol": t[0],
-            "entry": t[1],
-            "amount": t[2],
-            "highest": t[1],
-            "trail": False,
-            "partial": False,
-            "sl": t[1] * 0.98
-        })
-
-    send(f"♻ Restored {len(restored)} trades")
+    last_report = time.time()
 
     while True:
 
         try:
+
+            results = scanner()
+
+            for r in results[:5]:
+
+                df = indicators(klines(r["symbol"]))
+
+                open_trade(r["symbol"], df['c'].iloc[-1])
+
             check_trades()
 
-            symbols = get_symbols()
+            # 📊 daily report every 24h
+            if time.time() - last_report > 86400:
 
-            for symbol in symbols:
+                daily_report()
 
-                df = get_klines(symbol)
-                df = analyze(df)
+                daily_profit = 0
+                daily_trades = 0
+                last_report = time.time()
 
-                score = get_score(df)
-                prob = predict(df)
-
-                if score >= 4 and prob > 0.65:
-                    price = df['close'].iloc[-1]
-                    open_trade(symbol, price)
-
-                time.sleep(0.3)
+            time.sleep(60)
 
         except Exception as e:
-            print(e)
-
-        time.sleep(60)
+            print("ERROR:", e)
+            time.sleep(5)
 
 if __name__ == "__main__":
     run()
