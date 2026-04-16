@@ -23,8 +23,8 @@ threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 # =========================
 BASE_URL = "https://api.kucoin.com"
 
-TOKEN = os.getenv("8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68")
-CHAT_ID = os.getenv("5067771509")
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 TRADE_SIZE = 100
 MIN_SCORE = 75
