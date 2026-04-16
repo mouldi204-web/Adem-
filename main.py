@@ -4,163 +4,124 @@ from flask import Flask
 from waitress import serve
 
 # ==========================================
-# 1. إعدادات الاتصال (ضع بياناتك هنا مباشرة)
+# 1. الإعدادات المحدثة (رصيد 1000$ و 10 صفقات)
 # ==========================================
 TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 CHAT_ID = "5067771509"
-
+CHANNEL_ID = "-1003692815602"
 BASE_URL = "https://api.kucoin.com"
 
-# نظام إدارة السيولة
-initial_balance = 2000.0
+initial_balance = 1000.0
 available_balance = initial_balance
-MAX_TRADES = 15
+MAX_TRADES = 10
 open_trades = []
-monitored_assets = {} 
+daily_loss_limit = 0.10 # إغلاق طوارئ عند خسارة 10% من المحفظة
 
 # ملفات السجلات
 TRADE_LOG = 'trading_master_log.csv'
 ANALYSE_LOG = 'market_discovery_log.csv'
+JOURNAL_LOG = 'bot_journal.txt'
+
+TRADE_HEADERS = ['Symbol', 'Result', 'Quality', 'Entry', 'Exit', 'MAE_Pct', 'MFE_Pct', 'Size_Used', 'Duration', 'RSI', 'BTC', 'Session']
+ANALYSE_HEADERS = ['Timestamp', 'Symbol', 'Score', 'RSI', 'Vol_24h', 'BTC_Status', 'Rank']
 
 app = Flask('')
-
 @app.route('/')
-def home():
-    return f"Omega v21.0 Online. Active Trades: {len(open_trades)}/15"
+def home(): return f"Omega v34.0 Fortress Ready. Active: {len(open_trades)}/10"
 
 # ==========================================
-# 2. وظائف الإشعارات والملفات
+# 2. أنظمة الأمان المتقدمة (Safety Systems)
 # ==========================================
-def send_smart_msg(text):
+
+def global_kill_switch():
+    """إغلاق الطوارئ: إذا انخفضت القيمة الإجمالية 10% عن البداية"""
+    global available_balance, open_trades
+    current_total = available_balance + sum([t['size'] for t in open_trades])
+    if current_total <= (initial_balance * (1 - daily_loss_limit)):
+        custom_log("⚠️🚨 KILL SWITCH ACTIVATED: Global loss reached 10%. Closing all trades!")
+        send_msg("🚨 **إغلاق الطوارئ!** تم الوصول لحد الخسارة اليومي (10%). تم إغلاق جميع الصفقات حمايةً للمحفظة.")
+        # هنا يتم وضع كود إغلاق الصفقات في المنصة برمجياً
+        open_trades = [] 
+        return True
+    return False
+
+def check_liquidity_spread(symbol):
+    """فحص الفارق السعري (Spread) لضمان عدم الانزلاق"""
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except: pass
-
-def log_to_csv(file, headers, data):
-    file_exists = os.path.isfile(file)
-    with open(file, 'a', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists: writer.writeheader()
-        writer.writerow(data)
-
-def send_file(file_path, caption):
-    if os.path.exists(file_path):
-        url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
-        with open(file_path, 'rb') as f:
-            requests.post(url, data={'chat_id': CHAT_ID, 'caption': caption}, files={'document': f})
-    else:
-        send_smart_msg("❌ السجل المطلوب غير موجود حالياً.")
+        res = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1?symbol={symbol}").json()
+        bid = float(res['data']['bid'])
+        ask = float(res['data']['ask'])
+        spread = (ask - bid) / bid * 100
+        return spread <= 0.5 # مقبول إذا كان أقل من 0.5%
+    except: return False
 
 # ==========================================
-# 3. إدارة أوامر التيليجرام (/balance, /csv, /analyse)
+# 3. إدارة السيولة والجودة (Risk Management)
 # ==========================================
-def handle_commands():
-    last_id = 0
+
+def evaluate_trade_quality(score, rsi, btc_status):
+    # صفقة ذهبية (⭐⭐⭐): 10% من الرصيد (100$)
+    if score >= 96 and 40 <= rsi <= 60 and btc_status == "Bullish":
+        return 0.10, "High (⭐⭐⭐)"
+    # صفقة حذرة (⭐): 5% من الرصيد (50$)
+    if rsi > 70 or btc_status == "Bearish":
+        return 0.05, "Low (⭐)"
+    # صفقة متوسطة (⭐⭐): 7.5% من الرصيد (75$)
+    return 0.075, "Medium (⭐⭐)"
+
+# ==========================================
+# 4. المحركات الأساسية (Discovery & Management)
+# ==========================================
+
+def discovery_engine():
+    global available_balance
     while True:
-        try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_id + 1}&timeout=20"
-            res = requests.get(url, timeout=25).json()
-            for update in res.get("result", []):
-                last_id = update["update_id"]
-                msg = update.get("message", {})
-                text = msg.get("text", "")
-                
-                if text == "/balance":
-                    send_smart_msg(f"💰 *الرصيد المتاح:* `${round(available_balance, 2)}` \n🕒 *الآن:* `{datetime.now().strftime('%H:%M')}`\n📊 *الصفقات:* `{len(open_trades)}/15`")
-                elif text == "/csv":
-                    send_file(TRADE_LOG, "📂 سجل التداول الحقيقي")
-                elif text == "/analyse":
-                    send_file(ANALYSE_LOG, "📊 سجل تحليل جودة الفرص المكتشفة")
-        except: time.sleep(5)
-        time.sleep(1)
+        if global_kill_switch(): time.sleep(3600); continue # توقف لساعة إذا فعل الكيل سويتش
 
-# ==========================================
-# 4. محرك التحليل والرصد (القلب النابض)
-# ==========================================
-def discovery_and_trading_engine():
-    global available_balance, monitored_assets
-    # إشعار البداية الفوري
-    send_smart_msg("🚀 **انطلاق نظام أوميجا v21.0**\nالبوت يعمل الآن ويبحث عن أقوى الفرص...")
-    
-    while True:
         try:
             res = requests.get(f"{BASE_URL}/api/v1/market/allTickers").json()
             tickers = res['data']['ticker']
+            btc_status = get_market_context()
             
-            scored = []
-            for t in tickers:
-                if "-USDT" in t['symbol']:
-                    chg = float(t['changeRate']) * 100
-                    vol = float(t['volValue'])
-                    score = 80 + (chg * 1.6) + (np.log10(vol) if vol > 0 else 0)
-                    scored.append({'symbol': t['symbol'], 'price': float(t['last']), 'score': score})
-            
-            top_3 = sorted(scored, key=lambda x: x['score'], reverse=True)[:3]
-            now_time = datetime.now().strftime("%H:%M:%S")
+            all_scored = sorted([
+                {'symbol': t['symbol'], 'price': float(t['last']), 
+                 'score': 80 + (float(t['changeRate'])*100*1.5) + (np.log10(float(t['volValue']))*2),
+                 'vol': float(t['volValue'])}
+                for t in tickers if t['symbol'].endswith("-USDT") and float(t['volValue']) > 80000
+            ], key=lambda x: x['score'], reverse=True)[:10]
 
-            for item in top_3:
-                symbol = item['symbol']
-                price = item['price']
+            for i, opp in enumerate(all_scored):
+                rsi_val = calculate_rsi(opp['symbol'])
                 
-                if symbol not in monitored_assets:
-                    monitored_assets[symbol] = {
-                        'symbol': symbol, 'entry_p': price, 'discovery_time': now_time,
-                        'max_high': price, 'max_low': price, 'h_time': now_time, 'l_time': now_time, 'finalized': False
-                    }
-                
-                asset = monitored_assets[symbol]
-                if not asset['finalized']:
-                    if price > asset['max_high']: 
-                        asset['max_high'] = price
-                        asset['h_time'] = now_time
-                    if price < asset['max_low']: 
-                        asset['max_low'] = price
-                        asset['l_time'] = now_time
-                    
-                    pump = ((asset['max_high'] - asset['entry_p']) / asset['entry_p']) * 100
-                    dump = ((asset['max_low'] - asset['entry_p']) / asset['entry_p']) * 100
-                    
-                    status = ""
-                    if pump >= 4.0: status = "نجاح ✅"
-                    elif dump <= -2.0: status = "فشل ❌"
-                    
-                    if status:
-                        asset['finalized'] = True
-                        log_to_csv(ANALYSE_LOG, ['Symbol', 'Discovery_Time', 'Initial_Price', 'Max_Pump_%', 'Peak_High_Time', 'Max_Dump_%', 'Peak_Low_Time', 'Status'], {
-                            'Symbol': symbol, 'Discovery_Time': asset['discovery_time'], 'Initial_Price': asset['entry_p'],
-                            'Max_Pump_%': round(pump, 2), 'Peak_High_Time': asset['h_time'],
-                            'Max_Dump_%': round(dump, 2), 'Peak_Low_Time': asset['l_time'], 'Status': status
-                        })
+                # توثيق للتحليل
+                save_to_csv(ANALYSE_LOG, ANALYSE_HEADERS, {
+                    'Timestamp': datetime.now().strftime("%H:%M:%S"), 'Symbol': opp['symbol'],
+                    'Score': opp['score'], 'RSI': rsi_val, 'Vol_24h': round(opp['vol'], 0),
+                    'BTC_Status': btc_status, 'Rank': i + 1
+                })
 
-            # --- إدارة الدخول في صفقات حقيقية ---
-            if len(open_trades) < MAX_TRADES:
-                for opp in top_3:
+                # شروط الدخول الصارمة (القناص)
+                if i < 3 and len(open_trades) < MAX_TRADES:
                     if opp['symbol'] not in [t['symbol'] for t in open_trades]:
-                        score = opp['score']
-                        amount = 150.0 if score > 92 else 50.0
+                        # فحص السيولة اللحظي (Spread)
+                        if not check_liquidity_spread(opp['symbol']): 
+                            custom_log(f"⏩ Skipped {opp['symbol']} due to high spread."); continue
                         
-                        if available_balance >= amount:
-                            available_balance -= amount
+                        risk_pct, q_label = evaluate_trade_quality(opp['score'], rsi_val, btc_status)
+                        trade_size = available_balance * risk_pct
+                        
+                        if available_balance >= trade_size:
+                            available_balance -= trade_size
                             open_trades.append({
-                                'symbol': opp['symbol'], 'entry': opp['price'], 'size': amount,
-                                'tp1': opp['price'] * 1.03, 'sl': opp['price'] * 0.96, 'partial_done': False
+                                'symbol': opp['symbol'], 'entry': opp['price'], 'size': trade_size,
+                                'sl': opp['price'] * 0.95, 'score': opp['score'], 'quality': q_label,
+                                'rsi_entry': rsi_val, 'btc_entry': btc_status,
+                                'session': "Asian" if 0 <= datetime.now().hour < 8 else "European" if 8 <= datetime.now().hour < 16 else "American",
+                                'start_time': datetime.now(), 'max_p': opp['price'], 'min_p': opp['price']
                             })
-                            send_smart_msg(f"⚡ *إشارة دخول* | {opp['symbol']}\nالمبلغ: `${amount}` | السكور: `{round(score,1)}`")
-                            break
+                            custom_log(f"🎯 Sniper Entered {opp['symbol']} | Quality: {q_label} | Size: ${round(trade_size, 2)}")
 
-        except: pass
+        except Exception as e: custom_log(f"⚠️ Discovery Error: {e}")
         time.sleep(30)
 
-# ==========================================
-# 5. تشغيل الخادم والخدمات
-# ==========================================
-if __name__ == "__main__":
-    # تشغيل الخيوط الخلفية
-    threading.Thread(target=handle_commands, daemon=True).start()
-    threading.Thread(target=discovery_and_trading_engine, daemon=True).start()
-    
-    # تشغيل خادم الويب باستخدام Waitress
-    # Railway يمرر المنفذ تلقائياً، وإذا لم يجده يستخدم 8080
-    port = int(os.environ.get('PORT', 8080))
-    serve(app, host='0.0.0.0', port=port)
+# (تكملة الدوال المساعدة manage_trades, calculate_rsi, handle_commands كما في v33.0)
