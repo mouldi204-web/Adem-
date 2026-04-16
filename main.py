@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import threading
 from flask import Flask
-from datetime import datetime
 
 # =========================
 # TELEGRAM (INSIDE CODE)
@@ -23,30 +22,48 @@ def send(msg):
         pass
 
 # =========================
-# KEEP ALIVE
+# KEEP ALIVE SERVER
 # =========================
 app = Flask("")
+
 @app.route("/")
 def home():
-    return "BOT RUNNING"
+    return "OMEGA BOT RUNNING"
 
 threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
-# =========================
-# CONFIG
-# =========================
 BASE_URL = "https://api.kucoin.com"
-open_trades = []
+
+# =========================
+# MEMORY (SELF LEARNING)
+# =========================
+trade_memory = []
+
+def record_trade(symbol, result):
+    trade_memory.append({"symbol": symbol, "result": result})
+
+def adaptive_threshold():
+    if len(trade_memory) < 20:
+        return 70
+
+    recent = trade_memory[-50:]
+    win_rate = sum(t["result"] > 0 for t in recent) / len(recent)
+
+    if win_rate > 0.75:
+        return 60
+    elif win_rate < 0.5:
+        return 80
+    return 70
 
 # =========================
 # DATA
 # =========================
 def get_symbols():
     data = requests.get(BASE_URL + "/api/v1/symbols").json()['data']
-    return [s['symbol'] for s in data if s['quoteCurrency'] == 'USDT'][:150]
+    return [s['symbol'] for s in data if s['quoteCurrency'] == 'USDT'][:1200]
 
-def klines(symbol, tf):
-    url = BASE_URL + f"/api/v1/market/candles?type={tf}&symbol={symbol}"
+def klines(symbol):
+    url = BASE_URL + f"/api/v1/market/candles?type=5min&symbol={symbol}"
     data = requests.get(url).json()['data']
 
     df = pd.DataFrame(data, columns=['t','o','c','h','l','v','x'])
@@ -57,175 +74,192 @@ def klines(symbol, tf):
 
     return df
 
-# =========================
-# INDICATORS
-# =========================
 def indicators(df):
     df['ema9'] = df['c'].ewm(9).mean()
     df['ema21'] = df['c'].ewm(21).mean()
-    df['ema50'] = df['c'].ewm(50).mean()
-    df['ema200'] = df['c'].ewm(200).mean()
     return df
 
 # =========================
-# TREND CHECK
+# SMART MONEY
 # =========================
-def trend_ok(df):
-    return (
-        df['ema9'].iloc[-1] > df['ema21'].iloc[-1] >
-        df['ema50'].iloc[-1]
-    )
-
-# =========================
-# SQUEEZE
-# =========================
-def squeeze(df):
-    high = df['h'].rolling(20).max().iloc[-1]
-    low = df['l'].rolling(20).min().iloc[-1]
-    return (high - low) / df['c'].iloc[-1] < 0.02
-
-# =========================
-# GOLDEN CROSS
-# =========================
-def golden_cross(df):
-    return (
-        df['ema50'].iloc[-2] < df['ema200'].iloc[-2] and
-        df['ema50'].iloc[-1] > df['ema200'].iloc[-1]
-    )
-
-# =========================
-# CANDLE CONFIRMATION
-# =========================
-def candle_confirm(df):
-    last = df.iloc[-1]
+def smart_money(df):
+    vol = df['v'].iloc[-1]
     vol_ma = df['v'].rolling(20).mean().iloc[-1]
 
-    return (
-        last['c'] > last['o'] and
-        last['v'] > 1.5 * vol_ma and
-        last['c'] > (last['h'] * 0.98)
-    )
+    price = df['c'].iloc[-1]
+    high = df['h'].rolling(20).max().iloc[-1]
+    low = df['l'].rolling(20).min().iloc[-1]
+
+    position = (price - low) / (high - low)
+
+    return vol > 1.4 * vol_ma and position > 0.85
 
 # =========================
-# SCORE
+# OMEGA SCORE
 # =========================
-def score_system(df5, df15, df1h):
+def omega_score(df):
+
+    last = df.iloc[-1]
+
+    vol_ma = df['v'].rolling(20).mean().iloc[-1]
+    high = df['h'].rolling(20).max().iloc[-1]
+    low = df['l'].rolling(20).min().iloc[-1]
+
+    compression = (high - low) / last['c']
+    volume = last['v'] / vol_ma
+    breakout = last['c'] / high
 
     score = 0
 
-    # Trend (multi TF)
-    if trend_ok(df5) and trend_ok(df15) and trend_ok(df1h):
-        score += 35
-
-    # Squeeze (2 TF)
-    if squeeze(df5) and squeeze(df15):
+    if compression < 0.02:
+        score += 25
+    if volume > 1.3:
+        score += 25
+    if breakout > 0.985:
+        score += 25
+    if smart_money(df):
         score += 25
 
-    # Golden Cross (any TF)
-    if golden_cross(df5) or golden_cross(df15) or golden_cross(df1h):
-        score += 20
-
-    # Candle confirmation
-    if candle_confirm(df5):
-        score += 20
-
-    return score
+    return min(score, 100)
 
 # =========================
 # TIME PREDICTION
 # =========================
-def predict_time(score):
+def omega_time(score):
     if score >= 90:
+        return "1–8 min ⚡"
+    elif score >= 80:
         return "5–20 min"
-    elif score >= 85:
-        return "15–40 min"
-    else:
-        return "No setup"
+    elif score >= 70:
+        return "15–45 min"
+    return "No setup"
 
 # =========================
-# EXPECTED MOVE
+# WATCHLIST FILTER
 # =========================
-def expected_move(df):
-    atr = (df['h'] - df['l']).rolling(14).mean().iloc[-1]
-    price = df['c'].iloc[-1]
-    return round((atr / price) * 100 * 2.5, 2)
+def fast_filter(df):
+    return df['v'].iloc[-1] > df['v'].rolling(20).mean().iloc[-1]
 
 # =========================
-# LEVELS
+# ENTRY CONDITION
 # =========================
-def get_levels(df):
-    support = df['l'].rolling(20).min().iloc[-1]
-    resistance = df['h'].rolling(20).max().iloc[-2]
-    entry = df['c'].iloc[-1]
+def entry(df):
+    last = df.iloc[-1]
+    vol_ma = df['v'].rolling(20).mean().iloc[-1]
 
-    tp1 = entry + (resistance - support) * 0.5
-    tp2 = entry + (resistance - support)
-    sl = support
-
-    return tp1, tp2, sl
-
-# =========================
-# ALERT
-# =========================
-def alert(symbol, score, df5):
-
-    price = df5['c'].iloc[-1]
-    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    tp1, tp2, sl = get_levels(df5)
-    exp_move = expected_move(df5)
-    t_pred = predict_time(score)
-
-    send(f"""
-🚀 EXPLOSION SETUP
-
-{symbol}
-
-Price: {price}
-Time: {time_now}
-
-Score: {score}/100
-
-⏱ Time: {t_pred}
-📈 Move: ~{exp_move}%
-
-TP1: {tp1}
-TP2: {tp2}
-SL: {sl}
-""")
+    return (
+        last['c'] > df['h'].rolling(20).max().iloc[-2] and
+        last['v'] > 1.5 * vol_ma and
+        last['c'] > last['o']
+    )
 
 # =========================
-# SCANNER
+# OMEGA SCANNER
 # =========================
-def scanner():
+def omega_scan():
 
     symbols = get_symbols()
+
+    candidates = []
+    threshold = adaptive_threshold()
 
     for s in symbols:
 
         try:
-            df5 = indicators(klines(s, "5min"))
-            df15 = indicators(klines(s, "15min"))
-            df1h = indicators(klines(s, "1hour"))
+            df = indicators(klines(s))
 
-            score = score_system(df5, df15, df1h)
+            if not fast_filter(df):
+                continue
 
-            if score >= 85:
-                alert(s, score, df5)
+            score = omega_score(df)
+
+            if score >= threshold:
+                candidates.append((s, score, df))
 
         except:
             continue
 
+    candidates.sort(key=lambda x: x[1], reverse=True)
+
+    return candidates[:3]
+
+# =========================
+# SMART ALERTS
+# =========================
+def send_watch(symbol, score, time_pred):
+
+    send(f"""
+🟡 WATCHLIST ALERT
+
+{symbol}
+Score: {score}
+Time: {time_pred}
+
+⚠️ Preparing for possible breakout
+""")
+
+def send_entry(symbol, price, score):
+
+    send(f"""
+🚀 ENTRY SIGNAL
+
+{symbol}
+Price: {price}
+Score: {score}
+
+🔥 Breakout confirmed
+""")
+
+def send_exit(symbol, profit):
+
+    send(f"""
+📉 EXIT
+
+{symbol}
+Profit: {profit}$
+""")
+
 # =========================
 # MAIN LOOP
 # =========================
+open_trades = []
+
 def run():
 
-    send("🚀 BOT STARTED - ULTRA STRICT MODE")
+    send("⚛️ OMEGA BOT STARTED")
+
+    last_heartbeat = time.time()
 
     while True:
-        scanner()
-        time.sleep(120)
+
+        try:
+
+            top = omega_scan()
+
+            for s, score, df in top:
+
+                price = df['c'].iloc[-1]
+                tpred = omega_time(score)
+
+                send_watch(s, score, tpred)
+
+                if entry(df):
+
+                    open_trades.append({"symbol": s, "entry": price})
+
+                    send_entry(s, price, score)
+
+            # heartbeat كل 30 دقيقة
+            if time.time() - last_heartbeat > 1800:
+
+                send("🟢 OMEGA BOT STILL RUNNING")
+                last_heartbeat = time.time()
+
+            time.sleep(60)
+
+        except Exception as e:
+            send(f"⚠️ ERROR: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     run()
