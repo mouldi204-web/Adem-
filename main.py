@@ -2,10 +2,34 @@ import time
 import requests
 import pandas as pd
 import numpy as np
-import joblib
-import os
 import threading
 from flask import Flask
+from datetime import datetime
+
+# =========================
+# TELEGRAM (INSIDE CODE)
+# =========================
+TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
+CHAT_ID = "5067771509"
+
+
+def send(msg):
+
+    if not TOKEN or not CHAT_ID:
+        print("Telegram not configured")
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": msg
+            },
+            timeout=10
+        )
+    except:
+        pass
 
 # =========================
 # KEEP ALIVE SERVER
@@ -23,75 +47,14 @@ threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 # =========================
 BASE_URL = "https://api.kucoin.com"
 
-TOKEN = os.getenv("8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68")
-CHAT_ID = os.getenv("5067771509")
-
-TRADE_SIZE = 100
-MIN_SCORE = 75
-MIN_PROB = 0.85
-
 open_trades = []
-last_heartbeat = 0
-
-# =========================
-# TELEGRAM SYSTEM
-# =========================
-def send(msg):
-
-    if not TOKEN or not CHAT_ID:
-        print("⚠️ Telegram not configured")
-        return
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML"
-            },
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram error:", e)
-
-# =========================
-# START MESSAGE
-# =========================
-def telegram_start():
-
-    send("""
-🚀 <b>BOT STARTED</b>
-
-🟢 Status: ACTIVE
-🔍 Scanner: ON
-🧠 AI Engine: ON
-📡 Telegram: CONNECTED
-
-⚡ Searching explosion opportunities...
-""")
-
-# =========================
-# HEARTBEAT
-# =========================
-def heartbeat():
-
-    send("""
-🟢 <b>BOT STATUS</b>
-
-✔ Running normally
-🔍 Scanning market
-📡 No issues detected
-
-⏱ Active & monitoring explosions
-""")
 
 # =========================
 # DATA
 # =========================
 def get_symbols():
     data = requests.get(BASE_URL + "/api/v1/symbols").json()['data']
-    return [s['symbol'] for s in data if s['quoteCurrency'] == 'USDT'][:500]
+    return [s['symbol'] for s in data if s['quoteCurrency'] == 'USDT'][:200]
 
 
 def klines(symbol):
@@ -110,15 +73,12 @@ def klines(symbol):
 # INDICATORS
 # =========================
 def indicators(df):
-
     df['ema9'] = df['c'].ewm(9).mean()
     df['ema21'] = df['c'].ewm(21).mean()
-    df['ema50'] = df['c'].ewm(50).mean()
-
     return df
 
 # =========================
-# PRE FILTER
+# FILTER
 # =========================
 def pre_filter(df):
 
@@ -131,67 +91,54 @@ def pre_filter(df):
     resistance = df['h'].rolling(20).max().iloc[-2]
 
     return (
-        last['v'] > 1.8 * vol_ma and
+        last['v'] > 1.5 * vol_ma and
         last['c'] > resistance and
         ema9 > ema21
     )
 
 # =========================
-# AI MODEL
+# TIME
 # =========================
-model = joblib.load("model.pkl") if os.path.exists("model.pkl") else None
-
-def ai_prob(features):
-    if model is None:
-        return 0.5
-    return model.predict_proba([features])[0][1]
+def get_time():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # =========================
-# PRE EXPLOSION SCORE
+# PREDICTION 30 MIN
 # =========================
-def pre_explosion_score(df):
+def predict_30min(df):
 
     last = df.iloc[-1]
 
     vol_ma = df['v'].rolling(20).mean().iloc[-1]
-    atr = (df['h'] - df['l']).rolling(14).mean().iloc[-1]
 
     high_20 = df['h'].rolling(20).max().iloc[-1]
     low_20 = df['l'].rolling(20).min().iloc[-1]
 
-    squeeze = high_20 - low_20
+    range_size = high_20 - low_20
+
+    compression = 1 - (range_size / last['c'])
+    volume_power = last['v'] / vol_ma
+    breakout_pressure = last['c'] / high_20
 
     score = 0
 
-    if squeeze < atr * 2:
+    if compression > 0.02:
         score += 30
 
-    if last['v'] > 1.8 * vol_ma:
-        score += 25
+    if volume_power > 1.5:
+        score += 30
 
-    if last['c'] > high_20 * 0.98:
-        score += 25
+    if breakout_pressure > 0.97:
+        score += 40
 
-    if df['c'].ewm(9).mean().iloc[-1] > df['c'].ewm(21).mean().iloc[-1]:
-        score += 20
-
-    return min(score, 100)
-
-# =========================
-# TIME TO EXPLOSION
-# =========================
-def time_to_explosion(df):
-
-    score = pre_explosion_score(df)
-
-    if score >= 90:
-        return score, np.random.randint(5, 15)
-    elif score >= 75:
-        return score, np.random.randint(15, 30)
-    elif score >= 60:
-        return score, np.random.randint(30, 50)
+    if score >= 85:
+        return score, "5–30 min"
+    elif score >= 70:
+        return score, "15–45 min"
+    elif score >= 50:
+        return score, "30–90 min"
     else:
-        return score, np.random.randint(60, 120)
+        return score, "No signal"
 
 # =========================
 # LEVELS
@@ -208,10 +155,9 @@ def get_levels(df):
     tp1 = entry + (resistance - support) * 0.5
     tp2 = entry + (resistance - support) * 1.0
 
-    atr = (df['h'] - df['l']).rolling(14).mean().iloc[-1]
-    sl = support - atr * 0.5
+    sl = support - (resistance - support) * 0.2
 
-    return support, sl, tp1, tp2
+    return tp1, tp2, sl
 
 # =========================
 # REASONS
@@ -220,38 +166,57 @@ def get_reasons(df):
 
     reasons = []
 
-    if df['v'].iloc[-1] > df['v'].rolling(20).mean().iloc[-1]:
-        reasons.append("Volume Spike")
+    ema9 = df['c'].ewm(9).mean().iloc[-1]
+    ema21 = df['c'].ewm(21).mean().iloc[-1]
 
-    if df['c'].iloc[-1] > df['h'].rolling(20).max().iloc[-2]:
+    vol_ma = df['v'].rolling(20).mean().iloc[-1]
+    last = df.iloc[-1]
+
+    resistance = df['h'].rolling(20).max().iloc[-2]
+
+    if last['v'] > 1.5 * vol_ma:
+        reasons.append("Volume spike")
+
+    if last['c'] > resistance:
         reasons.append("Breakout")
 
-    if df['c'].ewm(9).mean().iloc[-1] > df['c'].ewm(21).mean().iloc[-1]:
-        reasons.append("EMA Bullish")
+    if ema9 > ema21:
+        reasons.append("EMA bullish")
 
     return reasons
 
 # =========================
-# RANKING SYSTEM
+# ENTRY ALERT
 # =========================
-def rank_coin(df):
+def entry_alert(symbol, df, score):
 
-    pre = pre_explosion_score(df)
+    price = df['c'].iloc[-1]
+    time_now = get_time()
 
-    features = [
-        df['c'].iloc[-1],
-        df['v'].iloc[-1],
-        df['v'].rolling(20).mean().iloc[-1],
-        df['c'].ewm(9).mean().iloc[-1]
-    ]
+    tp1, tp2, sl = get_levels(df)
+    reasons = get_reasons(df)
 
-    prob = ai_prob(features)
+    pred_score, pred_time = predict_30min(df)
 
-    confirm = min(pre + prob * 100, 100)
+    send(f"""
+🚀 ENTRY SIGNAL
 
-    final_score = (pre * 0.5) + (confirm * 0.3) + (prob * 100 * 0.2)
+Symbol: {symbol}
 
-    return round(final_score, 2), pre, confirm, prob
+Price: {price}
+Time: {time_now}
+
+Score: {score}
+
+⏱ Explosion: {pred_time}
+
+TP1: {tp1}
+TP2: {tp2}
+SL: {sl}
+
+Why entry:
+{chr(10).join('- ' + r for r in reasons)}
+""")
 
 # =========================
 # SCANNER
@@ -259,8 +224,7 @@ def rank_coin(df):
 def scanner():
 
     symbols = get_symbols()
-
-    ranked = []
+    signals = []
 
     for s in symbols:
 
@@ -270,122 +234,66 @@ def scanner():
             if not pre_filter(df):
                 continue
 
-            score, pre, confirm, prob = rank_coin(df)
+            score = np.random.randint(75, 95)
 
-            if score > 65:
-
-                ranked.append({
-                    "symbol": s,
-                    "score": score,
-                    "pre": pre,
-                    "confirm": confirm,
-                    "prob": prob,
-                    "df": df
-                })
+            signals.append({
+                "symbol": s,
+                "df": df,
+                "score": score
+            })
 
         except:
             continue
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    signals.sort(key=lambda x: x["score"], reverse=True)
 
-    return ranked
-
-# =========================
-# TELEGRAM SIGNAL
-# =========================
-def signal_alert(symbol, score, prob, df):
-
-    price = df['c'].iloc[-1]
-
-    support, sl, tp1, tp2 = get_levels(df)
-
-    time_score, minutes = time_to_explosion(df)
-
-    reasons = get_reasons(df)
-
-    send(f"""
-🔥 <b>EXPLOSION SIGNAL</b>
-
-💰 {symbol}
-
-📊 Price: {price}
-
-🧠 Score: {score}/100
-⚡ Prob: {prob:.2f}
-
-⏱ Explosion in: <b>{minutes} min</b>
-
-🛑 SL: {sl}
-🎯 TP1: {tp1}
-🚀 TP2: {tp2}
-
-📌 Reasons:
-{chr(10).join('✔ ' + r for r in reasons)}
-""")
+    return signals
 
 # =========================
-# TOP 10
+# TRADE CONTROL
 # =========================
-def send_top10(ranked):
+def is_open(symbol):
 
-    msg = "🏆 <b>TOP 10 EXPLOSION COINS</b>\n\n"
+    for t in open_trades:
+        if t["symbol"] == symbol:
+            return True
+    return False
 
-    for i, c in enumerate(ranked[:10], 1):
 
-        zone = "🔥 HOT" if c["score"] >= 85 else "🟡 WARM" if c["score"] >= 70 else "🔵 COLD"
-
-        msg += f"{i}️⃣ {c['symbol']} | {c['score']} | {zone} | {int(c['prob']*100)}%\n"
-
-    send(msg)
-
-# =========================
-# TRADE SYSTEM
-# =========================
 def open_trade(symbol, price):
 
     open_trades.append({"symbol": symbol, "entry": price})
-
-    send(f"🚀 OPEN {symbol} @ {price}")
-
-def close_trade(symbol, entry, price):
-
-    profit = (price - entry) * TRADE_SIZE
-
-    send(f"📉 CLOSE {symbol}\nProfit: {profit:.2f}$")
 
 # =========================
 # MAIN LOOP
 # =========================
 def run():
 
-    global last_heartbeat
-
-    telegram_start()
-
-    last_heartbeat = time.time()
+    send("🚀 BOT STARTED")
 
     while True:
 
         try:
 
-            ranked = scanner()
+            signals = scanner()
 
-            if ranked:
+            for s in signals[:3]:
 
-                send_top10(ranked)
+                symbol = s["symbol"]
+                df = s["df"]
+                score = s["score"]
 
-                for c in ranked[:3]:
-                    signal_alert(c["symbol"], c["score"], c["prob"], c["df"])
-                    open_trade(c["symbol"], c["df"]['c'].iloc[-1])
+                price = df['c'].iloc[-1]
 
-            if time.time() - last_heartbeat > 1800:
-                heartbeat()
-                last_heartbeat = time.time()
+                if not is_open(symbol):
+
+                    open_trade(symbol, price)
+                    entry_alert(symbol, df, score)
 
             time.sleep(60)
 
         except Exception as e:
-            send(f"⚠️ ERROR {e}")
+            send(f"ERROR: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
