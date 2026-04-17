@@ -3,195 +3,390 @@ import time, pandas as pd, numpy as np, os, csv, threading
 from datetime import datetime
 import requests
 
-# ==========================================
-# [1] الإعدادات الأساسية (الربط والملفات)
-# ==========================================
+# =========================
+# CONFIG
+# =========================
 TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
-TARGET_CHATS = ["5067771509", "-1002446777595"] 
+CHAT_ID = "5067771509"
+CHANNEL_ID = "-1003692815602"
 
-exchange = ccxt.kucoin({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+exchange = ccxt.gateio({'enableRateLimit': True})
 
-# ملفات السجلات والتدقيق
-FILE_AUDIT = 'trade_audit_log.csv'
-FILE_BURST_PERF = 'burst_performance_report.csv'
-FILE_ANALYSE = 'market_analysis.csv'
+MAX_TRADES = 10
+active_trades = 0
+lock = threading.Lock()
 
-# تهيئة الجداول بالعناوين الصحيحة
-for f_path, headers in [
-    (FILE_AUDIT, ['Timestamp', 'Symbol', 'Result', 'PNL%']),
-    (FILE_BURST_PERF, ['Time_Alert', 'Symbol', 'Price_At_Alert', 'Expected_Gain%', 'Max_Price_1h', 'Actual_Max_Gain%', 'Success_Status', 'Time_To_Peak']),
-    (FILE_ANALYSE, ['Timestamp', 'Symbol', 'Score', 'MFI'])
+# =========================
+# FILES
+# =========================
+FILE_ENTRIES = "entries.csv"
+FILE_WATCH = "watchlist.csv"
+FILE_EXPLOSIONS = "explosions.csv"
+FILE_RESULTS = "explosion_results.csv"
+
+for f, h in [
+    (FILE_ENTRIES, ["time","symbol","score","price","balance"]),
+    (FILE_WATCH, ["time","symbol","score","price"]),
+    (FILE_EXPLOSIONS, ["time","symbol","score","expected"]),
+    (FILE_RESULTS, ["time","symbol","entry","max","expected","status","time"])
 ]:
-    if not os.path.exists(f_path):
-        with open(f_path, 'w', newline='') as f:
-            csv.writer(f).writerow(headers)
+    if not os.path.exists(f):
+        with open(f,'w',newline='') as file:
+            csv.writer(file).writerow(h)
 
-market_status = "STABLE ✅"
-daily_pnl_tracker = []
+# =========================
+# MEMORY
+# =========================
+watch_memory = {}
+explosion_memory = {}
 
-# ==========================================
-# [2] محرك الإشعارات (The Notification Engine)
-# ==========================================
+# =========================
+# TELEGRAM
+# =========================
 def send_msg(text):
-    for chat_id in TARGET_CHATS:
-        try:
-            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-            requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=5)
-        except: pass
-
-def send_doc(chat_id, file_path, caption):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
-        with open(file_path, 'rb') as f:
-            requests.post(url, files={'document': f}, data={'chat_id': chat_id, 'caption': caption}, timeout=10)
-    except: pass
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": text}
+        )
+    except:
+        pass
 
-def notify(event, sym, score=0, price=0, res="", pnl=0, mfi=0, r_vol=0, exp_gain=0):
-    url_sym = sym.replace("/", "-")
-    trading_url = f"https://www.kucoin.com/trade/{url_sym}"
-    clean_s = sym.replace("/", "").replace("-", "")
-    
-    if event == "ENTRY":
-        msg = (f"🚀 **إشارة دخول مؤكدة**\n━━━━━━━━━━━━━━━━━━\n"
-               f"💎 **العملة:** [#{clean_s}]({trading_url})\n🔥 **السكور:** `{score}/100` 🏆\n"
-               f"💧 **MFI:** `{mfi:.1f}` | 📊 **Vol:** `{r_vol:.1f}x`\n━━━━━━━━━━━━━━━━━━\n"
-               f"🟢 **الدخول:** `{price:.8f}`\n🛑 **الوقف:** `ATR Dynamic`\n📡 #Adem_100_Entry")
-    elif event == "BURST":
-        msg = (f"🔍 **رادار الانفجار المتوقع**\n━━━━━━━━━━━━━━━━━━\n"
-               f"📡 **العملة:** [#{clean_s}]({trading_url})\n⚠️ **السكور:** `{score}/100`\n"
-               f"📈 **الربح المتوقع:** `+{exp_gain:.2f}%`\n💡 **الحالة:** زخم سيولة عالٍ.. مراقبة الاختراق\n📡 #Adem_100_Scanner")
-    elif event == "EXIT":
-        icon = "✅" if pnl > 0 else "❌"
-        msg = (f"{icon} **تقرير النتيجة النهائية**\n━━━━━━━━━━━━━━━━━━\n"
-               f"🏁 **العملة:** #{clean_s}\n🏁 **النتيجة:** `{res}`\n📈 **صافي الربح:** `{pnl:+.2f}%` \n📡 #Adem_100_Audit")
-    elif event == "STATUS":
-        msg = (f"📊 **حالة النظام والارباح**\n━━━━━━━━━━━━━━━━━━\n"
-               f"🛡️ **BTC:** `{res}`\n🔄 **Pairs:** `800+ Pairs`\n💰 **أرباح اليوم:** `{pnl:+.2f}%` \n📡 #Adem_100_Status")
-    send_msg(msg)
+def send_channel(text):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHANNEL_ID, "text": text}
+        )
+    except:
+        pass
 
-# ==========================================
-# [3] خبير التدقيق والأوامر (Audit & Commands)
-# ==========================================
-def audit_burst_event(sym, alert_price, expected_gain):
-    start_time = datetime.now()
-    max_price = alert_price
-    time_to_peak = "N/A"
-    while (datetime.now() - start_time).seconds < 3600:
-        try:
-            curr_p = exchange.fetch_ticker(sym)['last']
-            if curr_p > max_price:
-                max_price = curr_p
-                elapsed = datetime.now() - start_time
-                time_to_peak = f"{elapsed.seconds // 60} min"
-            if ((max_price - alert_price) / alert_price) * 100 > expected_gain + 5: break
-            time.sleep(20)
-        except: continue
-    actual_gain = ((max_price - alert_price) / alert_price) * 100
-    success = "✅ YES" if actual_gain >= expected_gain else "❌ NO"
-    with open(FILE_BURST_PERF, 'a', newline='') as f:
-        csv.writer(f).writerow([start_time.strftime('%H:%M:%S'), sym, f"{alert_price:.8f}", f"{expected_gain:.2f}%", f"{max_price:.8f}", f"{actual_gain:.2f}%", success, time_to_peak])
+# =========================
+# BALANCE
+# =========================
+def get_balance():
+    try:
+        bal = exchange.fetch_balance()
+        return bal['total'].get('USDT', 0)
+    except:
+        return 0
 
-def telegram_listener():
-    last_id = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-            r = requests.get(url, params={"offset": last_id + 1, "timeout": 30}).json()
-            for up in r.get("result", []):
-                last_id = up["update_id"]
-                msg = up.get("message", {})
-                txt = msg.get("text", "")
-                cid = msg.get("chat", {}).get("id")
-                
-                if txt == "/get_audit": send_doc(cid, FILE_AUDIT, "📊 سجل الصفقات")
-                elif txt == "/get_bursts": send_doc(cid, FILE_BURST_PERF, "💥 تقرير دقة الانفجارات")
-                elif txt == "/burst_stats":
-                    df = pd.read_csv(FILE_BURST_PERF)
-                    total = len(df); wins = len(df[df['Success_Status'].str.contains("YES")])
-                    rate = (wins/total*100) if total > 0 else 0
-                    send_msg(f"📈 **إحصائيات اليوم:**\n🎯 رصد: `{total}` | ✅ نجاح: `{wins}`\n📊 دقة التوقع: `{rate:.1f}%`")
-                elif txt == "/status": notify("STATUS", "GLOBAL", res=market_status, pnl=sum(daily_pnl_tracker))
-        except: time.sleep(5)
-
-# ==========================================
-# [4] المحرك الفني والفلاتر (The Sovereign Core)
-# ==========================================
-def calculate_metrics(df):
+# =========================
+# INDICATORS
+# =========================
+def calculate(df):
     df['sma20'] = df['close'].rolling(20).mean()
     df['std20'] = df['close'].rolling(20).std()
     df['bb_u'] = df['sma20'] + (df['std20'] * 2)
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    mf = tp * df['volume']
-    pos_f = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
-    neg_f = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
-    df['mfi'] = 100 - (100 / (1 + pos_f / neg_f))
-    df['tr'] = pd.concat([df['high']-df['low'], abs(df['high']-df['close'].shift()), abs(df['low']-df['close'].shift())], axis=1).max(axis=1)
-    df['atr'] = df['tr'].rolling(14).mean()
+
+    df['vol_avg'] = df['volume'].rolling(50).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
+    df['momentum'] = df['close'].pct_change(3)
     return df
 
-def is_btc_safe():
+# =========================
+# ORDER BOOK
+# =========================
+def order_book(sym):
     try:
-        btc = exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=2)
-        change = (btc[-1][4] - btc[-2][4]) / btc[-2][4] * 100
-        return change > -0.8
-    except: return True
+        ob = exchange.fetch_order_book(sym, limit=20)
+        bid = sum([b[1] for b in ob['bids'][:10]])
+        ask = sum([a[1] for a in ob['asks'][:10]])
 
-# ==========================================
-# [5] التشغيل والتحليل (Execution)
-# ==========================================
-def monitor_trade(sym, entry_p, atr):
-    sl = entry_p - (atr * 2); highest = entry_p; start = datetime.now()
-    while (datetime.now() - start).seconds < 14400:
+        if ask == 0:
+            return "NONE"
+
+        ratio = bid / ask
+
+        if ratio > 1.5:
+            return "BUY"
+        elif ratio < 0.7:
+            return "SELL"
+        return "NEUTRAL"
+    except:
+        return "NONE"
+
+# =========================
+# LOGS
+# =========================
+def log_entry(sym, score, price, bal):
+    with open(FILE_ENTRIES,'a',newline='') as f:
+        csv.writer(f).writerow([datetime.now(),sym,score,price,bal])
+
+def log_watch(sym, score, price):
+    with open(FILE_WATCH,'a',newline='') as f:
+        csv.writer(f).writerow([datetime.now(),sym,score,price])
+
+def log_explosion(sym, score, expected):
+    with open(FILE_EXPLOSIONS,'a',newline='') as f:
+        csv.writer(f).writerow([datetime.now(),sym,score,expected])
+
+# =========================
+# TRADE MONITOR
+# =========================
+def monitor(sym, entry):
+    global active_trades
+
+    highest = entry
+    sl = entry * 0.97
+    secure = entry * 1.02
+
+    while True:
         try:
-            curr = exchange.fetch_ticker(sym)['last']
-            pnl = (curr - entry_p) / entry_p * 100
-            if curr > highest: highest = curr; sl = max(sl, highest - (atr * 1.5))
-            if curr <= sl or pnl >= 12.0:
-                res = "WIN ✅" if pnl > 0 else "LOSS ❌"
-                notify("EXIT", sym, res=res, pnl=pnl)
-                with open(FILE_AUDIT, 'a', newline='') as f: csv.writer(f).writerow([datetime.now(), sym, res, f"{pnl:.2f}%"])
-                daily_pnl_tracker.append(pnl); break
-            time.sleep(20)
-        except: continue
+            price = exchange.fetch_ticker(sym)['last']
+            pnl = (price-entry)/entry*100
 
-def process_coin(sym):
+            if price > highest:
+                highest = price
+                sl = highest * 0.98
+
+            if price >= secure:
+                sl = entry
+
+            if price <= sl or pnl >= 15:
+                send_msg(f"🏁 CLOSED {sym} | {pnl:.2f}%")
+                break
+
+            time.sleep(10)
+        except:
+            pass
+
+    with lock:
+        active_trades -= 1
+
+# =========================
+# EXPLOSION TRACKER
+# =========================
+def update_explosions():
+    while True:
+        try:
+            for sym in list(explosion_memory.keys()):
+
+                d = explosion_memory[sym]
+
+                price = exchange.fetch_ticker(sym)['last']
+                entry = d["entry"]
+
+                change = (price-entry)/entry*100
+                d["max"] = max(d["max"], change)
+
+                expected = d["expected"]
+
+                if change >= expected:
+                    status = "BEAT_EXPECTATION"
+                elif change >= 5:
+                    status = "SUCCESS"
+                elif change <= -3:
+                    status = "FAIL"
+                else:
+                    continue
+
+                t = (datetime.now()-d["time"]).seconds/60
+
+                with open(FILE_RESULTS,'a',newline='') as f:
+                    csv.writer(f).writerow([
+                        datetime.now(),sym,entry,
+                        d["max"],expected,status,
+                        f"{t:.1f}"
+                    ])
+
+                send_msg(f"""
+💥 EXPLOSION RESULT
+{sym}
+📈 Actual: {d['max']:.2f}%
+🎯 Expected: {expected:.2f}%
+⏱ {t:.1f} min
+📊 {status}
+""")
+
+                del explosion_memory[sym]
+
+            time.sleep(20)
+
+        except:
+            time.sleep(5)
+
+# =========================
+# WATCH TRACKER
+# =========================
+def update_watch():
+    while True:
+        try:
+            for sym in list(watch_memory.keys()):
+
+                price = exchange.fetch_ticker(sym)['last']
+                entry = watch_memory[sym]["entry"]
+
+                change = (price-entry)/entry*100
+
+                watch_memory[sym]["high"] = max(watch_memory[sym].get("high",0), change)
+                watch_memory[sym]["low"] = min(watch_memory[sym].get("low",0), change)
+
+                if change >= 5:
+                    status = "SUCCESS"
+                elif change <= -3:
+                    status = "FAIL"
+                else:
+                    continue
+
+                with open("watch_results.csv","a",newline="") as f:
+                    csv.writer(f).writerow([
+                        datetime.now(),sym,entry,
+                        watch_memory[sym]["high"],
+                        watch_memory[sym]["low"],
+                        status
+                    ])
+
+                del watch_memory[sym]
+
+            time.sleep(20)
+
+        except:
+            time.sleep(5)
+
+# =========================
+# ULTRA SCORE ENGINE
+# =========================
+def process(sym):
+    global active_trades
+
     try:
         ticker = exchange.fetch_ticker(sym)
-        if ticker['quoteVolume'] < 1500000: return
-        bars = exchange.fetch_ohlcv(sym, timeframe='15m', limit=100)
-        df = calculate_metrics(pd.DataFrame(bars, columns=['t','o','h','l','close','volume']))
-        price = df['close'].iloc[-1]; atr_val = df['atr'].iloc[-1]
-        
-        # حساب السكور
-        score = 0
-        if price >= df['bb_u'].iloc[-1]: score += 30
-        if 60 <= df['mfi'].iloc[-1] <= 82: score += 30
-        rel_vol = df['volume'].iloc[-1] / df['volume'].rolling(50).mean().iloc[-1]
-        if rel_vol > 1.8: score += 40
-        if not is_btc_safe(): score = 0
-        
-        exp_gain = (atr_val / price) * 100 * 1.5 
-        if score >= 90:
-            notify("ENTRY", sym, score, price, mfi=df['mfi'].iloc[-1], r_vol=rel_vol)
-            threading.Thread(target=monitor_trade, args=(sym, price, atr_val), daemon=True).start()
-        elif 80 <= score < 90:
-            notify("BURST", sym, score, price, exp_gain=exp_gain)
-            threading.Thread(target=audit_burst_event, args=(sym, price, exp_gain), daemon=True).start()
-    except: pass
+        if ticker['quoteVolume'] < 2_000_000:
+            return
 
+        bars = exchange.fetch_ohlcv(sym,'15m',limit=120)
+        df = pd.DataFrame(bars, columns=['t','o','h','l','close','volume'])
+        df = calculate(df)
+
+        price = df['close'].iloc[-1]
+
+        # ATR
+        atr = (df['high']-df['low']).rolling(14).mean().iloc[-1]
+
+        # =========================
+        # SCORE 2.0
+        # =========================
+        score = 0
+
+        trend_up = price > df['ema50'].iloc[-1]
+        if trend_up:
+            score += 20
+
+        if price >= df['bb_u'].iloc[-1]:
+            score += 20
+
+        rel_vol = df['volume'].iloc[-1] / df['vol_avg'].iloc[-1]
+        if rel_vol > 3:
+            score += 30
+        elif rel_vol > 2:
+            score += 20
+        elif rel_vol > 1.5:
+            score += 10
+
+        momentum = df['momentum'].iloc[-1]
+        if 0.01 < momentum < 0.05:
+            score += 20
+
+        ob = order_book(sym)
+        if ob == "BUY":
+            score += 20
+        elif ob == "SELL":
+            score -= 15
+
+        bb_width = (df['bb_u'] - df['sma20']) / df['sma20']
+        squeeze = 1 - bb_width.iloc[-1]
+
+        if squeeze > 0.85:
+            score += 20
+        elif squeeze > 0.75:
+            score += 10
+
+        expected = (atr/price)*100*3
+
+        # =========================
+        # EXPLOSION ALERT
+        # =========================
+        if score >= 75 and squeeze > 0.85:
+
+            explosion_memory[sym] = {
+                "entry": price,
+                "expected": expected,
+                "time": datetime.now(),
+                "max": 0
+            }
+
+            log_explosion(sym, score, expected)
+
+            send_msg(f"💥 EXPLOSION ALERT\n{sym}\n+{expected:.2f}% expected")
+
+        # =========================
+        # WATCHLIST
+        # =========================
+        elif 80 <= score < 90:
+
+            watch_memory[sym] = {
+                "entry": price,
+                "high": 0,
+                "low": 0
+            }
+
+            log_watch(sym, score, price)
+
+        # =========================
+        # ENTRY
+        # =========================
+        if score >= 90:
+
+            balance = get_balance()
+
+            with lock:
+                if active_trades >= MAX_TRADES:
+                    return
+                active_trades += 1
+
+            log_entry(sym, score, price, balance)
+
+            send_msg(f"""
+🚀 ENTRY SIGNAL
+💎 {sym}
+📊 Score: {score}/100
+📈 Expected: +{expected:.2f}%
+💰 Price: {price}
+💵 Balance: {balance:.2f}
+🛑 SL: -3%
+🔒 Secure: +2%
+""")
+
+            threading.Thread(target=monitor,
+                             args=(sym, price),
+                             daemon=True).start()
+
+    except:
+        pass
+
+# =========================
+# MAIN
+# =========================
 def main():
-    print("🛡️ Adem_100 Sovereign Auditor: System Online.")
-    threading.Thread(target=telegram_listener, daemon=True).start()
+    print("🔥 ADEM EXPLOSION AI ULTRA FINAL RUNNING")
+
+    threading.Thread(target=update_explosions, daemon=True).start()
+    threading.Thread(target=update_watch, daemon=True).start()
+
     while True:
         try:
             exchange.load_markets()
-            pairs = [s for s in exchange.symbols if s.endswith('/USDT')][:800]
-            for i in range(0, 800, 200):
-                chunk = pairs[i:i+200]
-                threads = [threading.Thread(target=process_coin, args=(s,)) for s in chunk]
-                for t in threads: t.start()
-                for t in threads: t.join()
-            time.sleep(60)
-        except: time.sleep(10)
+            pairs = [s for s in exchange.symbols if s.endswith('/USDT')][:1000]
 
-if __name__ == "__main__": main()
+            for sym in pairs:
+                process(sym)
+
+            time.sleep(60)
+
+        except Exception as e:
+            print(e)
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
