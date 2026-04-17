@@ -1,5 +1,6 @@
-requests
 pandas
 numpy
+requests
 flask
 waitress
+python-telegram-bot==13.15
