@@ -1,16 +1,53 @@
-# Crypto Explosion AI Bot
+# 🤖 Trading Bot - Paper Trading with Explosion Detection
 
-AI trading bot for detecting crypto breakout opportunities.
+بوت تداول ورقي متقدم مع نظام اكتشاف الانفجارات الوشيكة
 
-## Features
-- AI ranking (0–100)
-- Pre-filter system
-- EMA + Volume + Breakout strategy
-- Trailing stop (1% start / 2% lock)
-- Telegram alerts
-- KuCoin integration
+## ✨ المميزات
 
-## Run
-```bash
-pip install -r requirements.txt
-python main.py
+- 📊 **مسح 1500 عملة** من Gate.io
+- 🎯 **نظام تسجيل متقدم** (سكور 0-150)
+- 💣 **اكتشاف الانفجارات الوشيكة** (احتمال 60-100%)
+- 💰 **تداول ورقي** برأس مال 1000$ افتراضي
+- 📈 **Trailing Stop Loss** ذكي
+- 🤖 **بوت Telegram** مع قناة خاصة
+- 🔄 **مراقبة 24/7** مع نظام إبقاء السيرفر مستيقظاً
+
+## 🚀 التشغيل على Railway
+
+1. انسخ المستودع
+2. اربطه بـ Railway
+3. أضف المتغيرات البيئية (اختياري)
+4. انتظر النشر التلقائي
+
+## 📋 أوامر Telegram
+
+| الأمر | الوظيفة |
+|-------|---------|
+| `/scan` | بدء مسح شامل |
+| `/status` | حالة البوت |
+| `/portfolio` | ملخص المحفظة |
+| `/help` | المساعدة |
+
+## ⚙️ الإعدادات
+
+يمكن تعديل الإعدادات مباشرة في أعلى ملف `main.py`
+
+## 📊 المؤشرات المستخدمة
+
+- RSI (14)
+- MACD (12,26,9)
+- ADX (14)
+- Bollinger Bands (20,2)
+- ATR (14)
+- Volume Analysis
+- Trend Analysis
+
+## 🔧 المتطلبات
+
+- Python 3.9+
+- Gate.io API (مجاني)
+- Telegram Bot Token
+
+## 📝 الترخيص
+
+MIT License
