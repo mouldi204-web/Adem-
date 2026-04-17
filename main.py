@@ -4,181 +4,168 @@ from flask import Flask
 from waitress import serve
 
 # ==========================================
-# 1. الإعدادات (بياناتك الشخصية)
+# 1. الإعدادات والروابط الأساسية
 # ==========================================
 TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 CHAT_ID = "5067771509"
 BASE_URL = "https://api.kucoin.com"
 
-# قائمة لمتابعة أداء العملات المسجلة
-monitoring_list = {} 
+ANALYSE_LOG = 'omega_event_log.csv'
+ANALYSE_HEADERS = ['Timestamp', 'Symbol', 'Event', 'Price', 'Detail']
+active_monitoring = {}
+market_status = "Unknown"
 
-# ملف السجلات للتحليل اللاحق
-ANALYSE_LOG = 'market_discovery_log.csv'
-ANALYSE_HEADERS = ['Timestamp', 'Symbol', 'Score', 'Entry_Price', 'Max_Up_%', 'Max_Down_%', 'Result', 'Duration_Min']
+# استبعاد العملات الثقيلة
+BLACKLIST = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT', 'XRP-USDT', 'ADA-USDT', 'AVAX-USDT']
 
 app = Flask('')
 @app.route('/')
-def home(): return "Omega v37.4 Stable - Smart Signals Active."
+def home(): return f"Omega v45.0 Status: {market_status} | Monitoring: {len(active_monitoring)}"
 
 # ==========================================
-# 2. نظام الإشعارات الذكية (Smart Notifications)
+# 2. وظائف التحليل التقني والسيولة
 # ==========================================
 
-def send_msg(text):
-    """دالة مركزية لإرسال الرسائل لتجنب أخطاء التعريف"""
+def get_technical_data(symbol):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-        requests.post(url, data=payload, timeout=10)
-    except Exception as e:
-        print(f"Telegram Error: {e}")
+        url = f"{BASE_URL}/api/v1/market/candles?symbol={symbol}&type=5min"
+        res = requests.get(url, timeout=10).json()
+        if 'data' not in res or not res['data']: return 50, 0, 0
+        closes = [float(c[2]) for c in res['data'][:20]]
+        closes.reverse()
+        
+        # RSI 14
+        diffs = np.diff(closes)
+        gains = [d if d > 0 else 0 for d in diffs]
+        losses = [-d if d < 0 else 0 for d in diffs]
+        avg_gain = sum(gains[-14:])/14
+        avg_loss = sum(losses[-14:])/14
+        rsi = 100 - (100 / (1 + (avg_gain/avg_loss))) if avg_loss != 0 else 100
+        
+        # EMA 20
+        ema_20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
+        return rsi, ema_20, closes[-1]
+    except: return 50, 0, 0
 
-def send_smart_entry_msg(sym, score, entry_p):
-    """إشعار منسق عند دخول العملة منطقة الرصد"""
-    msg = (f"🚀 **إشعار دخول ذكي**\n"
-           f"━━━━━━━━━━━━━━\n"
-           f"💎 **العملة:** #{sym.replace('-USDT', '')}\n"
-           f"📈 **السكور:** `{score}`\n"
-           f"🎯 **نقطة الدخول:** `{entry_p}`\n"
-           f"🏁 **الأهداف:** `+4%` | `-2%`\n"
-           f"━━━━━━━━━━━━━━\n"
-           f"⏰ {datetime.now().strftime('%H:%M:%S')}")
-    send_msg(msg)
-
-def send_smart_exit_msg(sym, result, data):
-    """إشعار منسق عند حسم النتيجة (نجاح/فشل)"""
-    duration = round((datetime.now() - data['start_time']).total_seconds() / 60, 1)
-    status_icon = "🟢" if "نجاح" in result else "🔴"
-    
-    msg = (f"{status_icon} **إشعار حسم النتيجة**\n"
-           f"━━━━━━━━━━━━━━\n"
-           f"💎 **العملة:** #{sym.replace('-USDT', '')}\n"
-           f"📊 **النتيجة:** `{result}`\n"
-           f"📈 **أقصى صعود:** `+{round(data['max_up'], 2)}%`\n"
-           f"📉 **أقصى هبوط:** `{round(data['max_down'], 2)}%`\n"
-           f"⏱️ **المدة:** `{duration}` دقيقة\n"
-           f"━━━━━━━━━━━━━━")
-    send_msg(msg)
+def check_explosion_signals(symbol):
+    try:
+        url = f"{BASE_URL}/api/v1/market/candles?symbol={symbol}&type=1min"
+        res = requests.get(url, timeout=10).json()
+        if 'data' not in res or len(res['data']) < 15: return 1.0, 10.0
+        candles = res['data']
+        
+        # تسارع السيولة اللحظي
+        current_vol = float(candles[0][5])
+        avg_past_vol = sum([float(c[5]) for c in candles[1:11]]) / 10
+        vol_spike = current_vol / avg_past_vol if avg_past_vol > 0 else 1.0
+        
+        # الانضغاط السعري
+        prices = [float(c[2]) for c in candles[:10]]
+        price_range = (max(prices) - min(prices)) / min(prices) * 100
+        return vol_spike, price_range
+    except: return 1.0, 10.0
 
 # ==========================================
-# 3. محرك الحكم والتسجيل (Judging Engine)
+# 3. نظام تسجيل الأحداث والتقرير الدوري
 # ==========================================
 
-def performance_judger():
-    """يراقب العملات المحفوظة ويحدد النجاح أو الفشل"""
-    while True:
-        for sym, data in list(monitoring_list.items()):
-            try:
-                # جلب السعر اللحظي
-                res = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1?symbol={sym}", timeout=10).json()
-                if 'data' not in res or res['data'] is None: continue
-                
-                curr_p = float(res['data']['price'])
-                
-                # حساب النسبة المئوية للتغير من نقطة الدخول
-                change = (curr_p - data['entry_price']) / data['entry_price'] * 100
-                data['max_up'] = max(data['max_up'], change)
-                data['max_down'] = min(data['max_down'], change)
-
-                # الحكم: نجاح (+4%) أو فشل (-2%)
-                if change >= 4.0:
-                    data['result'] = "نجاح ✅"
-                    save_to_csv(sym, data)
-                    send_smart_exit_msg(sym, data['result'], data)
-                    del monitoring_list[sym]
-                
-                elif change <= -2.0:
-                    data['result'] = "فشل ❌"
-                    save_to_csv(sym, data)
-                    send_smart_exit_msg(sym, data['result'], data)
-                    del monitoring_list[sym]
-            except Exception as e:
-                print(f"Error judging {sym}: {e}")
-                continue
-        time.sleep(15)
-
-def save_to_csv(sym, data):
-    """تصدير البيانات النهائية للملف"""
-    duration = round((datetime.now() - data['start_time']).total_seconds() / 60, 1)
+def log_event(sym, event, price, detail=""):
     file_exists = os.path.isfile(ANALYSE_LOG)
     with open(ANALYSE_LOG, 'a', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=ANALYSE_HEADERS)
         if not file_exists: writer.writeheader()
         writer.writerow({
-            'Timestamp': data['start_time'].strftime("%H:%M:%S"),
-            'Symbol': sym, 'Score': data['score'], 'Entry_Price': data['entry_price'],
-            'Max_Up_%': round(data['max_up'], 2), 'Max_Down_%': round(data['max_down'], 2),
-            'Result': data['result'], 'Duration_Min': duration
+            'Timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'Symbol': sym, 'Event': event, 'Price': price, 'Detail': detail
         })
 
+def send_msg(text):
+    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", 
+                       data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+    except: pass
+
 # ==========================================
-# 4. محرك الرصد (Elite Scanner Score > 90)
+# 4. محركات الرصد والمراقبة الذكية
 # ==========================================
+
+def update_market_regime():
+    global market_status
+    while True:
+        try:
+            url = f"{BASE_URL}/api/v1/market/candles?symbol=BTC-USDT&type=1hour"
+            res = requests.get(url, timeout=10).json()
+            curr_btc = float(res['data'][0][2])
+            closes = [float(c[2]) for c in res['data'][:20]]
+            ma20 = sum(closes) / 20
+            
+            new_status = "🟢 صاعد (Bullish)" if curr_btc > ma20 else "🔴 هابط (Bearish)"
+            if new_status != market_status:
+                market_status = new_status
+                send_msg(f"🌍 **تغير حالة السوق العام**\nالحالة الآن: `{market_status}`\nسعر BTC: `${curr_btc:,.0f}`")
+        except: pass
+        time.sleep(300)
 
 def discovery_engine():
-    """يبحث عن العملات التي تحقق سكور أعلى من 90"""
     while True:
         try:
+            if "🔴" in market_status: 
+                time.sleep(60); continue
+                
             res = requests.get(f"{BASE_URL}/api/v1/market/allTickers", timeout=15).json()
-            tickers = res['data']['ticker']
-            
-            for t in tickers:
+            for t in res['data']['ticker']:
                 sym = t['symbol']
-                # تصفية العملات المطلوبة
-                if not sym.endswith("-USDT") or any(x in sym for x in ["3L", "3S", "UP", "DOWN"]): continue
+                vol_24h = float(t['volValue'])
                 
-                vol = float(t['volValue'])
-                if vol < 100000: continue
+                # فلاتر الاستبعاد والسيولة
+                if not sym.endswith("-USDT") or sym in BLACKLIST or vol_24h < 300000 or vol_24h > 50000000: continue
                 
-                # حساب السكور الخوارزمي
-                score = 80 + (float(t['changeRate'])*150) + (np.log10(vol)*2)
-                
-                if score >= 90 and sym not in monitoring_list:
-                    # احتساب نقطة الدخول الواقعية (سعر Ask)
-                    res_book = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1?symbol={sym}", timeout=10).json()
-                    entry_p = float(res_book['data']['ask'])
-                    
-                    monitoring_list[sym] = {
-                        'entry_price': entry_p, 'score': round(score, 1),
-                        'start_time': datetime.now(), 'max_up': 0.0, 'max_down': 0.0, 'result': "Pending"
-                    }
-                    send_smart_entry_msg(sym, round(score, 1), entry_p)
-        except Exception as e:
-            print(f"Scanner Error: {e}")
-        time.sleep(40)
+                # فحص إشارة الانفجار
+                vol_spike, price_range = check_explosion_signals(sym)
+                if vol_spike > 2.5 and price_range < 0.7:
+                    rsi, ema_20, last_price = get_technical_data(sym)
+                    if rsi < 70 and last_price > ema_20:
+                        if sym not in active_monitoring:
+                            entry_p = float(t['last'])
+                            log_event(sym, "دخول (ENTRY)", entry_p, f"RSI: {round(rsi,1)}")
+                            active_monitoring[sym] = {
+                                'entry_price': entry_p, 'sl': entry_p * 0.97, 'tp2': entry_p * 1.07,
+                                'be_activated': False, 'start_time': datetime.now()
+                            }
+                            send_msg(f"🚀 **دخول انفجار**\nالعملة: #{sym}\nالسعر: `{entry_p}`\nالهدف: `+7%` | الوقف: `-3%`")
+        except: pass
+        time.sleep(25)
 
-# ==========================================
-# 5. نظام الأوامر (Command System)
-# ==========================================
-
-def handle_commands():
-    last_id = 0
+def performance_judger():
     while True:
-        try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset={last_id + 1}&timeout=20"
-            res = requests.get(url, timeout=25).json()
-            for update in res.get("result", []):
-                last_id = update["update_id"]
-                msg = update.get("message", {})
-                if str(msg.get("chat", {}).get("id")) == str(CHAT_ID):
-                    text = msg.get("text", "")
-                    if text == "/balance":
-                        send_msg(f"📊 **حالة النظام:**\nمراقبة نشطة: {len(monitoring_list)} عملات.")
-                    elif text == "/csv":
-                        if os.path.exists(ANALYSE_LOG):
-                            with open(ANALYSE_LOG, 'rb') as f:
-                                requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", 
-                                              data={'chat_id': CHAT_ID}, files={'document': f})
-        except: time.sleep(10)
+        for sym, data in list(active_monitoring.items()):
+            try:
+                res = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1?symbol={sym}", timeout=10).json()
+                curr_p = float(res['data']['price'])
+                change = (curr_p - data['entry_price']) / data['entry_price'] * 100
+
+                # 1. تأمين الربح (Break-even)
+                if change >= 2.0 and not data['be_activated']:
+                    data['sl'] = data['entry_price']
+                    data['be_activated'] = True
+                    log_event(sym, "تأمين (BE)", curr_p, "الربح +2%، الوقف عند الدخول")
+                    send_msg(f"🛡️ **تأمين صفقة:** #{sym}\nنقل الوقف لسعر الدخول.")
+
+                # 2. الخروج (الربح أو الوقف)
+                if curr_p >= data['tp2']:
+                    log_event(sym, "خروج (TP2)", curr_p, f"ربح نهائي: {round(change,2)}%")
+                    send_msg(f"✅ **خروج بنجاح:** #{sym}\nالربح المحقق: `+{round(change,2)}%`")
+                    del active_monitoring[sym]
+                elif curr_p <= data['sl']:
+                    reason = "خروج آمن (BE)" if data['be_activated'] else "خسارة (SL)"
+                    log_event(sym, f"خروج ({reason})", curr_p, f"النتيجة: {round(change,2)}%")
+                    send_msg(f"🏁 **إغلاق صفقة:** #{sym}\nالنتيجة: `{reason}`")
+                    del active_monitoring[sym]
+            except: continue
+        time.sleep(15)
 
 if __name__ == "__main__":
-    send_msg("⚙️ **نظام Omega v37.4 قيد التشغيل**\nيتم رصد السكور > 90 وتحليل الأهداف.")
-    
-    # تشغيل العمليات في الخلفية
-    threading.Thread(target=handle_commands, daemon=True).start()
-    threading.Thread(target=performance_judger, daemon=True).start()
+    send_msg("🛡️ **أوميجا v45.0 قيد التشغيل**\nتم تفعيل نظام السجلات الفورية وإدارة المخاطر.")
+    threading.Thread(target=update_market_regime, daemon=True).start()
     threading.Thread(target=discovery_engine, daemon=True).start()
-    
-    # تشغيل سيرفر الويب للبقاء حياً على الاستضافة
+    threading.Thread(target=performance_judger, daemon=True).start()
     serve(app, host='0.0.0.0', port=8080)
