@@ -1,210 +1,172 @@
-import time, requests, pandas as pd, numpy as np, os, csv, threading
-from datetime import datetime, timedelta
-from flask import Flask
-from waitress import serve
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+import ccxt
+import time, pandas as pd, numpy as np, os, csv, threading
+from datetime import datetime
+import requests
 
-# --- [1] الإعدادات الأساسية ---
+# ==========================================
+# [1] الإعدادات الأساسية والربط
+# ==========================================
 TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
-TARGET_CHATS = ["5067771509", "-1003692815602"] 
+TARGET_CHATS = ["5067771509", "-1002446777595"] # حسابك الشخصي + القناة
 
-FILE_TRADES = 'trades_history.csv'
-FILE_ANALYSE = 'market_analysis.csv'
+exchange = ccxt.kucoin({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
 
-INITIAL_BALANCE = 1000.0
-current_balance = INITIAL_BALANCE
-used_balance = 0.0
-active_monitoring = {}
-post_trade_watch = {}
-market_discovery = {}
-current_market_regime = "Unknown"
+# أسماء الملفات لتخزين البيانات
+FILE_AUDIT = 'trade_audit_log.csv'
+FILE_ANALYSE = 'market_analysis_report.csv'
 
-app = Flask('')
-@app.route('/')
-def home(): return f"Adem_trading| Adem__trading"
+# متغيرات الحالة العامة
+market_status = "STABLE ✅"
+daily_pnl_tracker = []
 
-# --- [2] محرك الإشعارات والتوثيق ---
-
+# ==========================================
+# [2] محرك الإشعارات والأوامر (Telegram Interface)
+# ==========================================
 def send_msg(text):
     for chat_id in TARGET_CHATS:
         try:
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", 
-                         data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+            url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}, timeout=5)
         except: pass
 
-def log_to_csv(file_name, data):
-    file_exists = os.path.isfile(file_name)
-    headers = list(data.keys())
-    with open(file_name, 'a', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        if not file_exists: writer.writeheader()
-        writer.writerow(data)
+def send_document(chat_id, file_path, caption):
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendDocument"
+        with open(file_path, 'rb') as f:
+            requests.post(url, files={'document': f}, data={'chat_id': chat_id, 'caption': caption}, timeout=10)
+    except: pass
 
-# --- [3] محرك مراقبة الأداء وما بعد الخروج ---
-
-def performance_judger():
-    global current_balance, used_balance
-    while True:
-        # 1. مراقبة الصفقات المفتوحة
-        for sym, data in list(active_monitoring.items()):
-            try:
-                p = float(requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={sym}").json()['data']['price'])
-                chg = (p - data['entry_p']) / data['entry_p'] * 100
-                data['max_up'] = max(data.get('max_up', 0), chg)
-                data['max_down'] = min(data.get('max_down', 0), chg)
-                data['current_p'] = p
-
-                if p <= data['sl'] or chg >= 15.0:
-                    prof = data['alloc'] * (chg / 100)
-                    current_balance += prof; used_balance -= data['alloc']
-                    duration = str(datetime.now() - data['start_time']).split('.')[0]
-                    
-                    # نقل للمراقبة البعدية
-                    post_trade_watch[sym] = {
-                        'exit_p': p, 'exit_time': datetime.now(), 'max_after': 0,
-                        'duration': duration, 'final_chg': chg, 'orig_max': data['max_up']
-                    }
-                    
-                    msg = (
-                        f"🏁 *إغلاق صفقة: #{sym}*\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"💵 *الربح المحقق:* `{chg:+.2f}%` (`{prof:+.2f}$`)\n"
-                        f"🕒 *مدة الصفقة:* `{duration}`\n"
-                        f"🔝 *أعلى قمة وصل لها:* `+{data['max_up']:.2f}%` 📈\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📡 *Adem__trading*"
-                    )
-                    send_msg(msg)
-                    del active_monitoring[sym]
-            except: continue
-
-        # 2. مراقبة سلوك العملة بعد الخروج (30 دقيقة)
-        for sym, pdata in list(post_trade_watch.items()):
-            try:
-                p = float(requests.get(f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={sym}").json()['data']['price'])
-                after_chg = (p - pdata['exit_p']) / pdata['exit_p'] * 100
-                pdata['max_after'] = max(pdata['max_after'], after_chg)
-                
-                if (datetime.now() - pdata['exit_time']).seconds > 1800:
-                    log_to_csv(FILE_TRADES, {
-                        'Close_Time': datetime.now().strftime('%Y-%m-%d %H:%M'),
-                        'Symbol': sym, 'Profit_%': f"{pdata['final_chg']:.2f}%", 
-                        'Duration': pdata['duration'], 'Max_During': f"{pdata['orig_max']:.2f}%",
-                        'Max_After_Exit': f"{pdata['max_after']:.2f}%",
-                        'Behavior': "MOVED UP 📈" if pdata['max_after'] > 2 else "GOOD EXIT ✅"
-                    })
-                    del post_trade_watch[sym]
-            except: continue
-        time.sleep(15)
-
-# --- [4] محرك تحليل الاكتشاف (Win/Loss & Speed) ---
-
-def discovery_analyzer():
-    global used_balance
-    while True:
-        try:
-            res = requests.get("https://api.kucoin.com/api/v1/market/allTickers").json()
-            for t in res['data']['ticker']:
-                sym, last_p = t['symbol'], float(t['last'])
-                vol = float(t['volValue'])
-                if not sym.endswith("-USDT") or vol < 200000: continue
-                score = round((float(t['changeRate']) * 100) + (np.log10(vol) * 2), 1)
-
-                if score >= 80 and sym not in market_discovery:
-                    market_discovery[sym] = {
-                        'start_p': last_p, 'start_time': datetime.now(), 'score': score,
-                        't3': None, 't5': None, 'tm2': None, 'tm3': None, 'max_up': 0, 'max_down': 0
-                    }
-                    # إشعار الدخول المطور
-                    if sym not in active_monitoring:
-                        alloc = 150.0 if score >= 95 else 50.0
-                        if (current_balance - used_balance) >= alloc:
-                            used_balance += alloc
-                            active_monitoring[sym] = {'sym': sym, 'entry_p': last_p, 'alloc': alloc, 'current_p': last_p, 'sl': last_p * 0.97, 'max_up': 0, 'max_down': 0, 'start_time': datetime.now()}
-                            
-                            roi_est = 5.0 + (score - 80) / 10
-                            surge_est = roi_est + 2.5
-                            msg = (
-                                f"📥 *دخول صفقة جديدة: #{sym}*\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"🎯 *الهدف التقديري:* `+{roi_est:.1f}%` 🔥\n"
-                                f"📈 *الارتفاع المتوقع:* `+{surge_est:.1f}%` 🚀\n"
-                                f"📊 *قوة الإشارة (Score):* `{score}`\n"
-                                f"💰 *سعر الدخول:* `{last_p:.8f}`\n"
-                                f"🛡 *وقف الخسارة:* `-3%`\n"
-                                f"━━━━━━━━━━━━━━━\n"
-                                f"📡 *Adem__trading*"
-                            )
-                            send_msg(msg)
-
-                if sym in market_discovery:
-                    d = market_discovery[sym]
-                    curr_chg = (last_p - d['start_p']) / d['start_p'] * 100
-                    d['max_up'] = max(d['max_up'], curr_chg)
-                    d['max_down'] = min(d['max_down'], curr_chg)
-                    now = datetime.now()
-                    
-                    if curr_chg >= 3.0 and not d['t3']: d['t3'] = str(now - d['start_time']).split('.')[0]
-                    if curr_chg >= 5.0 and not d['t5']: d['t5'] = str(now - d['start_time']).split('.')[0]
-                    if curr_chg <= -2.0 and not d['tm2']: d['tm2'] = str(now - d['start_time']).split('.')[0]
-                    if curr_chg <= -3.0 and not d['tm3']: d['tm3'] = str(now - d['start_time']).split('.')[0]
-
-                    if d['t5'] or d['tm3'] or (now - d['start_time']).seconds > 7200:
-                        res_val = "WIN ✅" if (d['t5'] and (not d['tm3'] or d['t5'] < d['tm3'])) else "LOSS ❌"
-                        log_to_csv(FILE_ANALYSE, {
-                            'Time': d['start_time'].strftime('%H:%M'), 'Symbol': sym, 'Score': d['score'],
-                            'Result': res_val, 'T_+5%': d['t5'] or 'N/A', 'T_+3%': d['t3'] or 'N/A',
-                            'T_-2%': d['tm2'] or 'N/A', 'Max_Peak': f"{d['max_up']:.2f}%", 'Min_Drop': f"{d['max_down']:.2f}%"
-                        })
-                        del market_discovery[sym]
-        except: pass
-        time.sleep(20)
-
-# --- [5] أوامر تليجرام ---
-
-def etat(update: Update, context: CallbackContext):
-    floating_pnl = sum([(d['current_p'] - d['entry_p']) / d['entry_p'] * 100 for d in active_monitoring.values()])
-    avg_floating = floating_pnl / len(active_monitoring) if active_monitoring else 0
-    total_val = current_balance + (used_balance * (1 + avg_floating/100 if active_monitoring else 1))
+def notify(event, sym, score=0, price=0, res="", pnl=0, mfi=0, r_vol=0):
+    url_sym = sym.replace("/", "-")
+    trading_url = f"https://www.kucoin.com/trade/{url_sym}"
+    clean_s = sym.replace("/", "").replace("-", "")
     
-    msg = (
-        f"📊 *تقرير أوميجا v76.0:*\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"🔋 *قوة العمل:* `{'HIGH 🔥' if len(active_monitoring) > 3 else 'STABLE 💎'}`\n"
-        f"🌍 *حالة السوق:* `{current_market_regime}`\n"
-        f"📦 *المفتوحة:* `{len(active_monitoring)}` صفقات\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"💰 *المحفظة:* `{total_val:.2f} USDT`\n"
-        f"💵 *المتاح:* `{current_balance - used_balance:.2f} USDT`\n"
-        f"📈 *النتيجة العائمة:* `{avg_floating:+.2f}%` 🌊\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📡 *Adem__trading*"
-    )
-    update.message.reply_text(msg, parse_mode='Markdown')
+    if event == "ENTRY":
+        msg = (f"🚀 **إشارة دخول (Buy Signal)**\n━━━━━━━━━━━━━━━━━━\n"
+               f"💎 **العملة:** [#{clean_s}]({trading_url})\n🔥 **السكور:** `{score}/100`\n"
+               f"💧 **MFI:** `{mfi:.1f}` | 📊 **Vol:** `{r_vol:.1f}x`\n━━━━━━━━━━━━━━━━━━\n"
+               f"🟢 **الدخول:** `{price:.8f}`\n🛑 **الوقف:** `{price*0.97:.8f}`\n"
+               f"🎯 **الهدف:** `+5% ~ +12%`\n📡 #Adem_100_Entry")
+    elif event == "BURST":
+        msg = (f"🔍 **رادار الانفجار (Burst Watch)**\n━━━━━━━━━━━━━━━━━━\n"
+               f"📡 **العملة:** [#{clean_s}]({trading_url})\n⚠️ **السكور:** `{score}/100`\n"
+               f"💡 **الحالة:** زخم سيولة متصاعد.. مراقبة الاختراق\n📡 #Adem_100_Scanner")
+    elif event == "EXIT":
+        icon = "✅" if pnl > 0 else "❌"
+        msg = (f"{icon} **تقرير النتيجة (Trade Result)**\n━━━━━━━━━━━━━━━━━━\n"
+               f"🏁 **العملة:** #{clean_s}\n🏁 **النتيجة:** `{res}`\n📈 **الربح:** `{pnl:+.2f}%` \n━━━━━━━━━━━━━━━━━━\n"
+               f"📡 #Adem_100_Audit")
+    elif event == "STATUS":
+        msg = (f"📊 **حالة النظام (System Status)**\n━━━━━━━━━━━━━━━━━━\n"
+               f"🛡️ **BTC:** `{res}`\n🔄 **Pairs:** `800+ USDT`\n💰 **أرباح اليوم:** `{pnl:+.2f}%`\n"
+               f"📅 **تحديث:** `{datetime.now().strftime('%H:%M')}`\n📡 #Adem_100_Status")
+    send_msg(msg)
 
-def update_market_logic():
-    global current_market_regime
+# ==========================================
+# [3] الفلاتر والمحرك الرياضي (The Guardian Core)
+# ==========================================
+def calculate_metrics(df):
+    df['sma20'] = df['close'].rolling(20).mean()
+    df['std20'] = df['close'].rolling(20).std()
+    df['bb_u'] = df['sma20'] + (df['std20'] * 2)
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    mf = tp * df['volume']
+    pos_f = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    neg_f = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    df['mfi'] = 100 - (100 / (1 + pos_f / neg_f))
+    df['vol_sma_long'] = df['volume'].rolling(50).mean()
+    return df
+
+def get_score(df):
+    last = df.iloc[-1]
+    score = 0
+    # 1. الاختراق
+    if last['close'] >= last['bb_u']: score += 30
+    # 2. تدفق الأموال
+    if 60 <= last['mfi'] <= 82: score += 30
+    # 3. السيولة النسبية
+    rel_vol = last['volume'] / last['vol_sma_long'] if last['vol_sma_long'] > 0 else 0
+    if rel_vol > 1.8: score += 40
+    # 4. فلاتر الحماية (عقوبات)
+    dist = ((last['close'] - last['sma20'])/last['sma20'])*100
+    if dist > 3.5: score -= 50 # عقوبة المسافة
+    body = abs(last['close'] - last['open'])
+    wick = last['high'] - max(last['close'], last['open'])
+    if wick > (body * 0.8): score -= 60 # عقوبة الذيل العلوي
+    return score, rel_vol, last['mfi']
+
+# ==========================================
+# [4] إدارة الأوامر والملفات (Command Listener)
+# ==========================================
+def telegram_listener():
+    last_id = 0
     while True:
         try:
-            res = requests.get("https://api.kucoin.com/api/v1/market/candles?symbol=BTC-USDT&type=15min").json()
-            closes = [float(c[2]) for c in res['data'][:20]]
-            ema = pd.Series(closes[::-1]).ewm(span=20, adjust=False).mean().iloc[-1]
-            current_market_regime = "BULLISH 🟢" if closes[0] > ema else "BEARISH 🔴"
-        except: pass
-        time.sleep(300)
+            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+            r = requests.get(url, params={"offset": last_id + 1, "timeout": 30}).json()
+            for up in r.get("result", []):
+                last_id = up["update_id"]
+                msg = up.get("message", {})
+                txt = msg.get("text", "")
+                cid = msg.get("chat", {}).get("id")
+                if txt == "/get_audit": send_document(cid, FILE_AUDIT, "سجل الصفقات")
+                elif txt == "/get_analysis": send_document(cid, FILE_ANALYSE, "تحليل السوق")
+                elif txt == "/status": notify("STATUS", "GLOBAL", res=market_status, pnl=sum(daily_pnl_tracker))
+        except: time.sleep(5)
 
-def run_telegram():
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler("etat", etat))
-    dp.add_handler(CommandHandler("analyse", lambda u, c: c.bot.send_document(chat_id=u.effective_chat.id, document=open(FILE_ANALYSE, 'rb'))))
-    dp.add_handler(CommandHandler("resultat", lambda u, c: c.bot.send_document(chat_id=u.effective_chat.id, document=open(FILE_TRADES, 'rb'))))
-    updater.start_polling(); updater.idle()
+# ==========================================
+# [5] تتبع الصفقات والمسح (Execution)
+# ==========================================
+def monitor_trade(sym, entry_p, score):
+    sl = entry_p * 0.97
+    tp1_hit = False
+    start = datetime.now()
+    while (datetime.now() - start).seconds < 14400:
+        try:
+            curr_p = exchange.fetch_ticker(sym)['last']
+            pnl = (curr_p - entry_p) / entry_p * 100
+            if pnl >= 3.5 and not tp1_hit:
+                tp1_hit = True
+                sl = entry_p * 1.01 # حجز ربح
+            if pnl >= 7.0: sl = max(sl, entry_p * 1.04) # رفع الوقف
+            if curr_p <= sl or pnl >= 12.0:
+                res = "SUCCESS ✅" if pnl > 0 else "FAILED ❌"
+                notify("EXIT", sym, res=res, pnl=pnl)
+                daily_pnl_tracker.append(pnl)
+                break
+            time.sleep(20)
+        except: continue
+
+def process_coin(sym):
+    try:
+        ticker = exchange.fetch_ticker(sym)
+        if ticker['quoteVolume'] < 1500000: return
+        bars = exchange.fetch_ohlcv(sym, timeframe='15m', limit=60)
+        df = calculate_metrics(pd.DataFrame(bars, columns=['t','o','h','l','close','volume']))
+        score, r_vol, mfi_val = get_score(df)
+        price = df['close'].iloc[-1]
+        
+        if score >= 90:
+            notify("ENTRY", sym, score, price, mfi=mfi_val, r_vol=r_vol)
+            threading.Thread(target=monitor_trade, args=(sym, price, score), daemon=True).start()
+        elif 80 <= score < 90:
+            notify("BURST", sym, score, price)
+    except: pass
+
+def main():
+    print("💎 Adem_100 Master Engine Online.")
+    threading.Thread(target=telegram_listener, daemon=True).start()
+    while True:
+        try:
+            exchange.load_markets()
+            pairs = [s for s in exchange.symbols if s.endswith('/USDT')][:800]
+            for i in range(0, 800, 200):
+                chunk = pairs[i:i+200]
+                threads = [threading.Thread(target=process_coin, args=(s,)) for s in chunk]
+                for t in threads: t.start()
+                for t in threads: t.join()
+            time.sleep(60)
+        except: time.sleep(10)
 
 if __name__ == "__main__":
-    threading.Thread(target=update_market_logic, daemon=True).start()
-    threading.Thread(target=discovery_analyzer, daemon=True).start()
-    threading.Thread(target=performance_judger, daemon=True).start()
-    threading.Thread(target=run_telegram, daemon=True).start()
-    serve(app, host='0.0.0.0', port=8080)
+    main()
