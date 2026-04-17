@@ -4,184 +4,117 @@ from datetime import datetime
 import requests
 
 # ==========================================
-# [1] الإعدادات الأساسية والمالية
+# [1] الإعدادات الأساسية (تأكد من الـ Token)
 # ==========================================
 TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 TARGET_CHATS = ["5067771509", "-1002446777595"] 
 exchange = ccxt.gateio({'enableRateLimit': True})
 
-FILE_SCANNER = 'scanner_results.csv'
-MAX_VIRTUAL_TRADES = 50   
-TRADE_AMOUNT = 20         
-STOP_LOSS_PCT = 0.03      # وقف خسارة عند -3%
+FILE_ACTIVE = 'active_trades.csv'
+FILE_RESULTS = 'scanner_results.csv'
+MAX_VIRTUAL_TRADES = 100  # رفعنا الحد لـ 100 لاستيعاب النشاط المكثف
+TRADE_AMOUNT = 20
 
 active_scans = {}
-BOOT_TIME = datetime.now()
 
-# تهيئة جدول النتائج
-if not os.path.exists(FILE_SCANNER):
-    with open(FILE_SCANNER, 'w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(['Discovery_Time', 'Symbol', 'Discovery_Price', 'Max_Rise%', 'Max_Drop%', 'Status'])
+# تهيئة الجداول
+for f, h in [(FILE_ACTIVE, ['Time', 'Symbol', 'Price', 'Goal(+5%)', 'Stop(-3%)']),
+             (FILE_RESULTS, ['Time', 'Symbol', 'Entry', 'Max_Rise', 'Max_Drop', 'Final_Status'])]:
+    if not os.path.exists(f):
+        pd.DataFrame(columns=h).to_csv(f, index=False)
 
 # ==========================================
-# [2] نظام الإشعارات المتطور
+# [2] محرك الإشعارات (Telegram)
 # ==========================================
-def send_alert(msg, alert_type="INFO"):
-    headers = {
-        "EXPLOSION": "🔥 **إنفجار سعري وشيك** 🔥",
-        "ENTRY": "✅ **دخول صفقة جديدة**",
-        "EXIT": "🏁 **خروج وتأمين الأرباح**",
-        "STATUS": "📊 **تحديث الحالة**",
-        "DISCOVERY": "📡 **اكتشاف عملة مرشحة**"
-    }
-    header = headers.get(alert_type, "📢 **تنبيه**")
-    full_msg = f"{header}\n{msg}"
-    
+def send_alert(msg, type="INFO"):
+    headers = {"ENTRY": "✅ **دخول ومراقبة**", "EXIT": "🏁 **حسم النتيجة**", "DISCOVERY": "📡 **رصد نشاط**"}
+    full_msg = f"{headers.get(type, '📢')} \n{msg}"
     for c in TARGET_CHATS:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", 
-                          data={"chat_id": c, "text": full_msg, "parse_mode": "Markdown"})
+        try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", data={"chat_id": c, "text": full_msg, "parse_mode": "Markdown"})
         except: pass
 
 # ==========================================
-# [3] محرك الرصد (Explosion Detector)
+# [3] فلتر المسح الواسع (Scoring)
 # ==========================================
 def process_coin(sym):
     global active_scans
     try:
-        if sym in active_scans: return 
+        if sym in active_scans or len(active_scans) >= MAX_VIRTUAL_TRADES: return 
 
         ticker = exchange.fetch_ticker(sym)
-        if ticker['quoteVolume'] < 5000: return 
+        if ticker['quoteVolume'] < 500: return # فلتر سيولة منخفض لزيادة العملات
 
-        bars = exchange.fetch_ohlcv(sym, timeframe='15m', limit=50)
-        df = pd.DataFrame(bars, columns=['t','o','h','l','close','volume'])
+        bars = exchange.fetch_ohlcv(sym, timeframe='15m', limit=30)
+        df = pd.DataFrame(bars, columns=['t','o','h','l','close','v'])
         
-        # حساب المؤشرات الفنية
-        df['sma20'] = df['close'].rolling(20).mean()
-        df['std20'] = df['close'].rolling(20).std()
-        df['bb_u'] = df['sma20'] + (df['std20'] * 2)
-        df['bb_w'] = (df['bb_u'] - (df['sma20'] - (df['std20'] * 2))) / df['sma20'] # عرض البولنجر
+        # مؤشرات سريعة
+        last_close = df['close'].iloc[-1]
+        sma = df['close'].rolling(20).mean().iloc[-1]
+        rsi = calculate_rsi(df).iloc[-1]
         
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # 1. إشعار اكتشاف (Discovery): إذا اقتربت من الاختراق
-        if last['close'] >= last['bb_u'] * 0.98 and last['close'] < last['bb_u']:
-             print(f"📡 Discovery: {sym} near breakout.")
+        # سكور مرن (50 كافي للدخول)
+        score = 0
+        if last_close > sma: score += 25
+        if 40 < rsi < 75: score += 25
+        if last_close > df['close'].iloc[-2]: score += 10
 
-        # 2. منطق الانفجار: تضيق (Squeeze) + اختراق قوي للسعر والفوليوم
-        is_squeeze = df['bb_w'].iloc[-10:-2].mean() < 0.03 
-        is_breakout = last['close'] > prev['bb_u']
-        volume_spike = last['volume'] > df['volume'].iloc[-10:-1].mean() * 1.5
-
-        if is_breakout and (is_squeeze or volume_spike):
-            price = last['close']
-            # توقع الارتفاع بناءً على زخم الانفجار
-            expected_rise = round(((last['close'] - prev['close']) / prev['close']) * 100 * 2.5, 2)
-            if expected_rise < 5: expected_rise = 8.5 # حد أدنى للتوقع
-            
-            explosion_msg = (f"العملة: #{sym.split('_')[0]}\n"
-                             f"سعر الدخول: `{price:.8f}`\n"
-                             f"الارتفاع المتوقع: `+{expected_rise}%` 🚀")
-            send_alert(explosion_msg, "EXPLOSION")
-            
+        if score >= 50:
             active_scans[sym] = True
-            threading.Thread(target=track_performance, args=(sym, price), daemon=True).start()
+            # 1. الكتابة في جدول العملات النشطة
+            with open(FILE_ACTIVE, 'a', newline='') as f:
+                csv.writer(f).writerow([datetime.now().strftime('%H:%M:%S'), sym, last_close, last_close*1.05, last_close*0.97])
+            
+            # 2. إرسال إشعار الدخول
+            send_alert(f"العملة: #{sym.split('_')[0]}\nالسعر: `{last_close}`\nالسكور: `{score}`", "ENTRY")
+            
+            threading.Thread(target=track_performance, args=(sym, last_close), daemon=True).start()
     except: pass
 
+def calculate_rsi(df, periods=14):
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
+    rs = gain / loss.replace(0, 0.001)
+    return 100 - (100 / (1 + rs))
+
 # ==========================================
-# [4] متابعة الأداء (Trailing & 5/3 Rule)
+# [4] المراقبة والتدوين النهائي
 # ==========================================
 def track_performance(sym, entry_p):
     global active_scans
-    max_p = entry_p
-    min_p = entry_p
-    start_time = datetime.now().strftime('%H:%M:%S')
-
+    hi, lo = entry_p, entry_p
     while True:
         try:
-            time.sleep(20)
-            curr_ticker = exchange.fetch_ticker(sym)
-            curr_p = curr_ticker['last']
+            time.sleep(15)
+            curr = exchange.fetch_ticker(sym)['last']
+            hi, lo = max(hi, curr), min(lo, curr)
+            pnl = ((curr - entry_p) / entry_p) * 100
 
-            if curr_p > max_p: max_p = curr_p
-            if curr_p < min_p: min_p = curr_p
-
-            rise_pct = ((max_p - entry_p) / entry_p) * 100
-            drop_pct = ((min_p - entry_p) / entry_p) * 100
-            current_pnl = ((curr_p - entry_p) / entry_p) * 100
-
-            # شرط الفشل: -3% قبل النجاح
-            if current_pnl <= -3.0:
-                finish_trade(sym, entry_p, curr_p, rise_pct, drop_pct, "فشل (خسارة 3%)")
-                break
-
-            # شرط النجاح: +5% 
-            elif current_pnl >= 5.0:
-                finish_trade(sym, entry_p, curr_p, rise_pct, drop_pct, "نجاح (ربح 5%)")
+            if pnl >= 5.0 or pnl <= -3.0:
+                status = "SUCCESS 🟢" if pnl >= 5.0 else "FAILED 🔴"
+                # الكتابة في جدول النتائج النهائي
+                with open(FILE_RESULTS, 'a', newline='') as f:
+                    csv.writer(f).writerow([datetime.now(), sym, entry_p, f"{((hi-entry_p)/entry_p)*100:.2f}%", f"{((lo-entry_p)/entry_p)*100:.2f}%", status])
+                
+                # إشعار الخروج
+                send_alert(f"العملة: #{sym}\nالنتيجة: `{pnl:.2f}%`\nالحالة: {status}", "EXIT")
+                del active_scans[sym]
                 break
         except: break
 
-def finish_trade(sym, entry_p, exit_p, rise, drop, status):
-    global active_scans
-    pnl = ((exit_p - entry_p) / entry_p) * 100
-    profit_usd = (TRADE_AMOUNT * pnl) / 100
-    
-    # تعمير الجدول
-    with open(FILE_SCANNER, 'a', newline='') as f:
-        csv.writer(f).writerow([datetime.now(), sym, entry_p, f"{rise:.2f}%", f"{drop:.2f}%", status])
-    
-    # إشعار الخروج
-    icon = "🟢" if "نجاح" in status else "🔴"
-    exit_msg = (f"العملة: #{sym.split('_')[0]}\n"
-                f"النتيجة: `{pnl:.2f}%` (${profit_usd:.2f})\n"
-                f"أقصى صعود: `{rise:.2f}%` | الحالة: {status}")
-    send_alert(exit_msg, "EXIT")
-    
-    if sym in active_scans: del active_scans[sym]
-
-# ==========================================
-# [5] التشغيل والتحكم
-# ==========================================
-def telegram_listener():
-    last_id = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-            r = requests.get(url, params={'offset': last_id + 1, 'timeout': 30}).json()
-            for up in r.get("result", []):
-                last_id = up["update_id"]
-                msg = up.get("message", {})
-                txt = msg.get("text", "").lower()
-                cid = msg.get("chat", {}).get("id")
-
-                if txt == "/status":
-                    send_alert(f"الرادار يعمل..\nعدد العملات تحت المراقبة: `{len(active_scans)}`", "STATUS")
-                elif txt == "/get_results":
-                    if os.path.exists(FILE_SCANNER):
-                        with open(FILE_SCANNER, 'rb') as f:
-                            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", params={'chat_id': cid}, files={'document': f})
-        except: time.sleep(5)
-
 def main():
-    print("🚀 Adem_100 Explosion Hunter: Online.")
-    threading.Thread(target=telegram_listener, daemon=True).start()
-    send_alert("تم تفعيل الرادار الشامل.\nإدارة رأس المال: 20$ لكل صفقة\nالهدف: +5% | الوقف: -3%", "STATUS")
-    
+    print("📡 Adem_100: High-Activity Mode Started.")
+    send_alert("بدء الرادار بنظام النشاط المكثف.. ترقب الإشعارات والجداول الآن.", "DISCOVERY")
     while True:
         try:
             exchange.load_markets()
-            all_pairs = [s for s in exchange.symbols if s.endswith('_USDT')]
-            for i in range(0, len(all_pairs), 100):
-                batch = all_pairs[i:i+100]
+            pairs = [s for s in exchange.symbols if s.endswith('_USDT')]
+            for i in range(0, len(pairs), 50):
+                batch = pairs[i:i+50]
                 threads = [threading.Thread(target=process_coin, args=(s,)) for s in batch]
                 for t in threads: t.start()
                 for t in threads: t.join()
-                time.sleep(2)
-            time.sleep(30)
-        except: time.sleep(10)
+            time.sleep(10)
+        except: time.sleep(5)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
