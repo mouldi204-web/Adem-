@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Gate.io Auto Trading Bot - Final Working Version
-"""
-
 import os
 import time
 import json
@@ -12,7 +8,6 @@ import ccxt
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ================== SETTINGS ==================
 TELEGRAM_TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 TELEGRAM_CHAT_ID = "5067771509"
 
@@ -34,7 +29,6 @@ USE_TESTNET = True
 
 STABLE_COINS = ['USDC', 'USDT', 'BUSD', 'DAI', 'TUSD', 'FDUSD']
 
-# ================== SCANNER SETTINGS ==================
 MAX_SYMBOLS = 1200
 BATCH_SIZE = 100
 BATCH_DELAY = 10
@@ -48,7 +42,6 @@ PRECONDITIONS = {
     'min_liquidity': 0.001,
 }
 
-# ================== GLOBALS ==================
 balance = INITIAL_BALANCE
 open_trades = {}
 closed_trades = []
@@ -66,7 +59,6 @@ exchange = ccxt.gateio({'enableRateLimit': True, 'rateLimit': 1200, 'options': {
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
 
-# ================== TELEGRAM ==================
 def send_telegram(text, chat_id=None):
     target = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -77,7 +69,6 @@ def send_telegram(text, chat_id=None):
     except Exception as e:
         print("Telegram error:", e)
 
-# ================== DATA FETCHING ==================
 def get_price(symbol):
     try:
         ticker = exchange.fetch_ticker(f"{symbol}/USDT")
@@ -114,7 +105,6 @@ def fetch_ohlcv(symbol, timeframe='1h', limit=100):
     except:
         return []
 
-# ================== TECHNICAL INDICATORS ==================
 def calculate_rsi(ohlcv, period=14):
     closes = [c[4] for c in ohlcv]
     if len(closes) < period + 1:
@@ -185,7 +175,6 @@ def calculate_atr(ohlcv, period=14):
         tr_values.append(tr)
     return sum(tr_values[-period:]) / period
 
-# ================== PRECISE ENTRY & TP/SL ==================
 def calculate_precise_entry(current_price, ohlcv_1h, ohlcv_4h):
     support_1h, _ = get_support_resistance(ohlcv_1h, current_price)
     support_4h, _ = get_support_resistance(ohlcv_4h, current_price)
@@ -213,7 +202,6 @@ def calculate_dynamic_tp_sl(entry_price, atr, support, resistance):
     tp3 = entry_price * 1.10
     return [tp1, tp2, tp3], sl_price
 
-# ================== SCORING (MULTI-TIMEFRAME) ==================
 def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, coin_win_rate):
     score = 0
     price = ticker_data['price']
@@ -221,33 +209,28 @@ def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, 
     volume = ticker_data['volume']
     high = ticker_data['high']
     low = ticker_data['low']
-
     if change > 10: score += 15
     elif change > 8: score += 12
     elif change > 6: score += 9
     elif change > 4: score += 6
     elif change > 2: score += 3
     elif change > 1: score += 1
-
     if volume > 200_000_000: score += 10
     elif volume > 100_000_000: score += 8
     elif volume > 50_000_000: score += 6
     elif volume > 20_000_000: score += 4
     elif volume > 10_000_000: score += 2
-
     if price < 0.05: score += 8
     elif price < 0.1: score += 6
     elif price < 0.5: score += 4
     elif price < 1: score += 2
     elif price < 2: score += 1
-
     if high > 0 and low > 0:
         volatility = ((high - low) / low) * 100
         if 5 <= volatility <= MAX_VOLATILITY:
             score += 5
         elif volatility > MAX_VOLATILITY:
             score -= 5
-
     if ohlcv_1h and len(ohlcv_1h) >= 20:
         volumes = [c[5] for c in ohlcv_1h[-21:-1]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 1
@@ -255,42 +238,33 @@ def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, 
         if vol_ratio > 2: score += 5
         elif vol_ratio > 1.5: score += 3
         elif vol_ratio > 1.2: score += 1
-
     trend_15m = get_trend(ohlcv_15m)
     trend_1h = get_trend(ohlcv_1h)
     trend_4h = get_trend(ohlcv_4h)
     bullish_count = sum([1 for t in [trend_15m, trend_1h, trend_4h] if t == 1])
     if bullish_count >= 2: score += 10
     elif bullish_count == 1: score += 5
-
     if ohlcv_1h and len(ohlcv_1h) >= 15:
         rsi = calculate_rsi(ohlcv_1h)
         if 30 <= rsi <= 50: score += 5
         elif rsi > 70: score -= 5
-
     if ohlcv_1h and len(ohlcv_1h) >= 26:
         macd, _ = calculate_macd(ohlcv_1h)
         if macd > 0: score += 5
-
     if ohlcv_1h and len(ohlcv_1h) >= 20:
         if calculate_bb_width(ohlcv_1h) < 0.05: score += 3
-
     if coin_win_rate is not None:
         if coin_win_rate > 70: score += 4
         elif coin_win_rate > 60: score += 2
         elif coin_win_rate > 50: score += 1
-
     if btc_change is not None:
         if btc_change < -2: score = score * 0.7
         elif btc_change > 2: score = score * 1.1
-
     hour = datetime.now().hour
     if hour < ACTIVE_HOURS_START or hour > ACTIVE_HOURS_END:
         score = score * 0.8
-
     return max(0, min(100, int(score)))
 
-# ================== TRADING LOGIC ==================
 def get_position_size(score, volatility=None):
     base = 50
     if score >= 90: size = base * 1.5
@@ -375,16 +349,13 @@ def monitor_trades():
         trade = open_trades[sym]
         ret = ((cur - trade['entry_price']) / trade['entry_price']) * 100
         if cur > trade['highest']: trade['highest'] = cur
-
         if cur <= trade['sl_price']:
             close_trade(sym, "SL", 1.0)
             send_telegram(f"❌ SL {sym} | Return: {ret:+.2f}%")
             continue
-
         if not trade.get('breakeven_activated') and ret >= BREAKEVEN_ACTIVATION:
             trade['breakeven_activated'] = True
             send_telegram(f"🔒 Breakeven activated for {sym}")
-
         for i, tp in enumerate(trade['tp_levels']):
             if trade.get('targets_hit', 0) <= i and cur >= tp:
                 close_percent = PROFIT_TARGET_PARTS[i]
@@ -392,7 +363,6 @@ def monitor_trades():
                 trade['targets_hit'] = i+1
                 send_telegram(f"✅ TP {PROFIT_TARGETS[i]}% hit for {sym} | Closed {close_percent*100:.0f}%")
                 break
-
         if sym in open_trades:
             trade = open_trades[sym]
             if sym not in trailing:
@@ -406,14 +376,12 @@ def monitor_trades():
                 elif cur > trade['highest']:
                     trailing[sym] = cur * (1 - TRAILING_STOP_DISTANCE / 100)
 
-# ================== SCAN PIPELINE ==================
 def passes_prefilter(symbol, ticker_data):
     price = ticker_data['price']
     change = ticker_data['change']
     volume = ticker_data['volume']
     bid = ticker_data.get('bid', price)
     ask = ticker_data.get('ask', price)
-
     if price < PRECONDITIONS['min_price']:
         return False, f"price {price:.4f} < {PRECONDITIONS['min_price']}"
     if volume < PRECONDITIONS['min_volume']:
@@ -446,7 +414,6 @@ def scan_and_trade():
         candidates = []
         total_batches = (len(all_symbols) + BATCH_SIZE - 1) // BATCH_SIZE
         processed = 0
-
         for batch_start in range(0, len(all_symbols), BATCH_SIZE):
             batch = all_symbols[batch_start:batch_start+BATCH_SIZE]
             for symbol in batch:
@@ -478,7 +445,6 @@ def scan_and_trade():
             if batch_start + BATCH_SIZE < len(all_symbols):
                 time.sleep(BATCH_DELAY)
             send_telegram(f"📊 Batch {batch_start//BATCH_SIZE +1}/{total_batches} | Processed {processed}/{len(all_symbols)} | Candidates: {len(candidates)}")
-
         candidates.sort(key=lambda x: x[2], reverse=True)
         if candidates:
             msg = "📊 Top candidates:\n"
@@ -495,7 +461,6 @@ def scan_and_trade():
     finally:
         scanning = False
 
-# ================== AUTO LOOPS ==================
 def auto_scan_loop():
     while True:
         now = datetime.now()
@@ -510,7 +475,6 @@ def monitor_loop():
         monitor_trades()
         time.sleep(30)
 
-# ================== WEB DASHBOARD ==================
 def get_portfolio_status():
     total_value = balance
     for trade in open_trades.values():
@@ -554,7 +518,6 @@ def start_web():
     port = int(os.environ.get('PORT', 8080))
     HTTPServer(('0.0.0.0', port), WebHandler).serve_forever()
 
-# ================== TELEGRAM COMMANDS ==================
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     if offset: url += f"?offset={offset}"
@@ -608,14 +571,12 @@ def handle_commands():
             print("Cmd error:", e)
             time.sleep(5)
 
-# ================== MAIN ==================
 if __name__ == "__main__":
     print("=" * 60)
     print("🚀 GATE.IO PRO BOT STARTED")
     print(f"Mode: {'TESTNET' if USE_TESTNET else 'LIVE'}")
     print(f"Initial balance: ${INITIAL_BALANCE}")
     print("=" * 60)
-
     threading.Thread(target=start_web, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
