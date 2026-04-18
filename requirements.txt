@@ -1,3 +1,7 @@
-requests
-numpy
+flask
+ccxt
 pandas
+numpy
+requests
+apscheduler
+gunicorn
