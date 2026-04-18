@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Adem Trading Bot - Stable Version for Render
-No external dependencies, only standard library.
+Adem Trading Bot - Corrected Version
+No triple-quote errors, works on Render.
 """
 
 import os
@@ -12,7 +12,7 @@ import urllib.request
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# ================== الإعدادات ==================
+# ================== SETTINGS ==================
 TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 CHAT_ID = "5067771509"
 
@@ -20,25 +20,27 @@ INITIAL_BALANCE = 1000
 TRADE_AMOUNT = 50
 MAX_OPEN_TRADES = 20
 
-# متغيرات البوت
+# Global variables
 balance = INITIAL_BALANCE
 open_trades = {}
 closed_trades = []
 last_update_id = 0
 scanning = False
-detected_coins = {}   # تخزين العملات المكتشفة
+detected_coins = {}
 start_time = time.time()
 
-# ================== دوال مساعدة ==================
+# ================== TELEGRAM ==================
 def send_telegram(text, chat_id=None):
     target = chat_id or CHAT_ID
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     data = json.dumps({"chat_id": target, "text": text, "parse_mode": "HTML"}).encode()
     try:
-        urllib.request.urlopen(urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}), timeout=10)
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print("Telegram error:", e)
 
+# ================== PRICE & PORTFOLIO ==================
 def get_price(symbol):
     try:
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT"
@@ -67,7 +69,7 @@ def get_portfolio_status():
         "win_rate": win_rate
     }
 
-# ================== كشف الانفجارات ==================
+# ================== EXPLOSION SCAN ==================
 def scan_for_explosions():
     global scanning, detected_coins
     scanning = True
@@ -78,20 +80,27 @@ def scan_for_explosions():
             data = json.loads(r.read().decode())
             explosions = []
             for item in data:
-                if not item["symbol"].endswith("USDT"): continue
+                if not item["symbol"].endswith("USDT"):
+                    continue
                 symbol = item["symbol"][:-4]
                 change = float(item["priceChangePercent"])
                 volume = float(item["quoteVolume"])
                 price = float(item["lastPrice"])
-                # حساب السكور
                 score = 0
-                if change > 5: score += 35
-                elif change > 3: score += 20
-                elif change > 1: score += 10
-                if volume > 50_000_000: score += 30
-                elif volume > 10_000_000: score += 20
-                if price < 0.5: score += 15
-                elif price < 2: score += 10
+                if change > 5:
+                    score += 35
+                elif change > 3:
+                    score += 20
+                elif change > 1:
+                    score += 10
+                if volume > 50_000_000:
+                    score += 30
+                elif volume > 10_000_000:
+                    score += 20
+                if price < 0.5:
+                    score += 15
+                elif price < 2:
+                    score += 10
                 if score >= 65:
                     explosions.append((symbol, price, change, score))
                     if symbol not in detected_coins:
@@ -101,7 +110,6 @@ def scan_for_explosions():
                             "score": score,
                             "status": "ACTIVE"
                         }
-            # ترتيب وإرسال إشعارات
             explosions.sort(key=lambda x: x[3], reverse=True)
             for sym, price, ch, sc in explosions[:5]:
                 send_telegram(f"💥 <b>{sym}</b>\nScore: {sc}/100 | Change: {ch:+.1f}%\nPrice: ${price:.6f}\n/buy {sym}")
@@ -111,7 +119,7 @@ def scan_for_explosions():
     finally:
         scanning = False
 
-# ================== فتح وإغلاق الصفقات ==================
+# ================== TRADING ==================
 def open_trade(symbol, price, score):
     global balance, open_trades
     if len(open_trades) >= MAX_OPEN_TRADES:
@@ -160,7 +168,7 @@ def close_all_trades():
     for s in list(open_trades.keys()):
         close_trade(s, "CLOSE_ALL")
 
-# ================== صفحة الويب ==================
+# ================== WEB SERVER ==================
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -184,18 +192,19 @@ class WebHandler(BaseHTTPRequestHandler):
             <hr>
             <p>💥 Detected coins: {len(detected_coins)}</p>
             <p>📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-            <p><small>Use Telegram commands: /explode, /buy SYMBOL, /close SYMBOL, /portfolio</small></p>
+            <p><small>Telegram: /explode, /buy SYMBOL, /close SYMBOL, /portfolio</small></p>
         </body>
         </html>
         """
         self.wfile.write(html.encode())
-    def log_message(self, format, *args): pass
+    def log_message(self, format, *args):
+        pass
 
 def start_web():
     port = int(os.environ.get("PORT", 8080))
     HTTPServer(("0.0.0.0", port), WebHandler).serve_forever()
 
-# ================== أوامر Telegram ==================
+# ================== TELEGRAM COMMANDS ==================
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     if offset:
@@ -218,21 +227,23 @@ def handle_commands():
                 chat = msg.get("chat", {}).get("id")
                 if not chat:
                     continue
+
                 if text == "/start":
                     send_telegram("🤖 Bot started. Use /explode to scan, /buy SYMBOL to trade.", chat)
+
                 elif text == "/explode":
                     if scanning:
                         send_telegram("Scan already in progress...", chat)
                     else:
                         threading.Thread(target=scan_for_explosions, daemon=True).start()
                         send_telegram("🔍 Scanning started...", chat)
+
                 elif text.startswith("/buy"):
                     parts = text.split()
                     if len(parts) < 2:
                         send_telegram("Usage: /buy SYMBOL (e.g., /buy SOL)", chat)
                     else:
                         sym = parts[1].upper()
-                        # البحث في آخر اكتشافات
                         price = get_price(sym)
                         if price == 0:
                             send_telegram(f"❌ Cannot get price for {sym}", chat)
@@ -247,6 +258,7 @@ def handle_commands():
                                 send_telegram(f"✅ Opened {sym} at ${price:.6f}", chat)
                             else:
                                 send_telegram(f"❌ {res}", chat)
+
                 elif text.startswith("/close"):
                     parts = text.split()
                     if len(parts) < 2:
@@ -258,22 +270,28 @@ def handle_commands():
                             send_telegram(f"✅ Closed {sym} | Return: {res['final_return']:+.1f}% | Profit: ${res['profit_loss']:+.2f}", chat)
                         else:
                             send_telegram(f"❌ {res}", chat)
+
                 elif text == "/closeall":
                     close_all_trades()
                     send_telegram("✅ Closed all trades.", chat)
+
                 elif text == "/portfolio":
                     st = get_portfolio_status()
                     msg = f"💰 Balance: ${st['balance']:.2f}\n📈 Total PnL: ${st['total_pnl']:+.2f}\n📊 Return: {st['return_pct']:+.1f}%\n🟢 Open: {st['open_trades']} | 🔒 Closed: {st['closed_trades']}\n✅ Win Rate: {st['win_rate']:.1f}%"
                     send_telegram(msg, chat)
+
                 else:
                     if text:
                         send_telegram("Unknown command. Use /start", chat)
+
             time.sleep(1)
         except Exception as e:
-            print(f"Commands error: {e}")
+            print("Commands error:", e)
             time.sleep(5)
 
-# ================== التشغيل الرئيسي ==================
+# ================== MAIN ==================
 if __name__ == "__main__":
     print("Starting bot...")
-    # تشغيل خادم الويب في خيط منفصل
+    web_thread = threading.Thread(target=start_web, daemon=True)
+    web_thread.start()
+    handle_commands()
