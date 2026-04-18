@@ -1,64 +1,50 @@
 #!/usr/bin/env python3
 """
-Trading Bot - Telegram Only Version
-نسخة خفيفة للنسخة المجانية من Railway
+Gate.io Breakout Scanner - Real-time Market Mover Detection
+يكتشف العملات التي تظهر إشارات اختراق قوية على منصة Gate.io
 """
 
-import os
 import time
 import json
 import urllib.request
-from datetime import datetime
 import threading
-import csv
+from datetime import datetime
 
 # ============================================
-# الإعدادات الأساسية
+# الإعدادات
 # ============================================
 
-TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
-CHAT_ID = "5067771509"
-CHANNEL_ID = "1001003692815602"
+TELEGRAM_TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
+TELEGRAM_CHAT_ID = "5067771509"
+TELEGRAM_CHANNEL_ID = "1001003692815602"
 
-INITIAL_BALANCE = 1000
-TRADE_AMOUNT = 50
-MAX_OPEN_TRADES = 20
-PROFIT_TARGET = 5
-STOP_LOSS = -3
-TRAILING_STOP_ACTIVATION = 2
-TRAILING_STOP_DISTANCE = 1.5
-MIN_DAILY_VOLATILITY = 4.0
+# إعدادات المسح
+MAX_SYMBOLS = 500
+MIN_SCORE = 60
+SCAN_INTERVAL = 300  # 5 دقائق بين كل مسح
 
-STABLE_COINS = ['USDC', 'USDT', 'BUSD', 'DAI', 'TUSD', 'USDP', 'FDUSD']
-SLOW_LARGE_COINS = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'MATIC', 'DOT', 'LTC', 'TRX', 'TON', 'LINK', 'AVAX', 'SHIB', 'XLM', 'BCH', 'NEAR', 'ALGO', 'VET']
+# إعدادات المؤشرات
+EMA_PERIOD = 20
+VOLUME_PERIOD = 20
+RSI_PERIOD = 14
+BREAKOUT_PERIOD = 20
 
-# ============================================
-# متغيرات البوت
-# ============================================
+# العملات المستبعدة (العملات المستقرة)
+STABLE_COINS = ['USDC', 'USDT', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'USDD', 'USDP', 'GUSD', 'PAX']
 
-last_update_id = 0
-bot_running = True
-scanning = False
-last_scan_result = []
-open_trades = {}
-closed_trades = []
-balance = INITIAL_BALANCE
-volatility_cache = {}
-
-TRADES_FILE = "trades.csv"
-PORTFOLIO_FILE = "portfolio.csv"
-TOP10_FILE = "top10.csv"
+# العملات الكبيرة البطيئة (يمكن تفعيلها حسب الرغبة)
+# SLOW_LARGE_COINS = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'MATIC', 'DOT', 'LTC', 'TRX', 'TON', 'LINK', 'AVAX', 'SHIB']
 
 # ============================================
-# دوال مساعدة
+# دوال المساعدة
 # ============================================
 
-def send_msg(text, chat_id=None, parse_mode='HTML'):
+def send_telegram(text, parse_mode='HTML'):
+    """إرسال رسالة إلى Telegram"""
     try:
-        target = chat_id or CHAT_ID
-        url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
+        url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
         data = json.dumps({
-            'chat_id': target,
+            'chat_id': TELEGRAM_CHAT_ID,
             'text': text,
             'parse_mode': parse_mode,
             'disable_web_page_preview': True
@@ -67,629 +53,409 @@ def send_msg(text, chat_id=None, parse_mode='HTML'):
         urllib.request.urlopen(req, timeout=10)
         return True
     except Exception as e:
-        print(f"Send error: {e}")
+        print(f"Telegram error: {e}")
         return False
 
 def send_to_channel(text):
-    return send_msg(text, CHANNEL_ID)
-
-def get_price(symbol='BTC'):
+    """إرسال إلى القناة"""
     try:
-        url = 'https://api.gateio.ws/api/v4/spot/tickers'
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read().decode())
-            for item in data:
-                if item['currency_pair'] == f'{symbol}_USDT':
-                    return float(item['last'])
-        return 0
-    except:
-        return 0
+        url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+        data = json.dumps({
+            'chat_id': TELEGRAM_CHANNEL_ID,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': True
+        }).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        print(f"Channel error: {e}")
+        return False
 
-def get_all_prices():
+def fetch_klines_gateio(symbol, interval='1h', limit=100):
+    """جلب بيانات الشموع من Gate.io"""
     try:
-        url = 'https://api.gateio.ws/api/v4/spot/tickers'
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read().decode())
-            prices = {}
-            for item in data:
-                if item['currency_pair'].endswith('_USDT'):
-                    symbol = item['currency_pair'].replace('_USDT', '')
-                    prices[symbol] = {
-                        'price': float(item['last']),
-                        'change': float(item.get('change_percentage', 0)),
-                        'volume': float(item.get('quote_volume', 0))
-                    }
-            return prices
-    except:
-        return {}
+        # Gate.io API endpoint للشموع
+        # صيغة السعر: BTC_USDT (بينها شرطة سفلية)
+        formatted_symbol = symbol.replace('USDT', '_USDT')
+        
+        # تحويل الفاصل الزمني
+        interval_map = {
+            '1m': '1m',
+            '5m': '5m', 
+            '15m': '15m',
+            '1h': '1h',
+            '4h': '4h',
+            '1d': '1d'
+        }
+        gate_interval = interval_map.get(interval, '1h')
+        
+        url = f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair={formatted_symbol}&interval={gate_interval}&limit={limit}"
+        
+        with urllib.request.urlopen(url, timeout=15) as response:
+            data = json.loads(response.read().decode())
+            
+            klines = []
+            for k in data:
+                klines.append({
+                    'time': int(k[0]),
+                    'open': float(k[5]),   # Gate.io تنسيق مختلف
+                    'high': float(k[3]),
+                    'low': float(k[4]),
+                    'close': float(k[2]),
+                    'volume': float(k[6])
+                })
+            return klines
+    except Exception as e:
+        print(f"Error fetching {symbol} from Gate.io: {e}")
+        return None
 
-def calculate_volatility(symbol):
-    global volatility_cache
-    if symbol in volatility_cache:
-        cache_time, volatility = volatility_cache[symbol]
-        if (datetime.now() - cache_time).seconds < 3600:
-            return volatility
+def fetch_ticker_gateio(symbol):
+    """جلب بيانات التيكر الحالية من Gate.io"""
     try:
-        url = f"https://api.gateio.ws/api/v4/spot/tickers"
-        with urllib.request.urlopen(url, timeout=10) as r:
-            data = json.loads(r.read().decode())
-            for item in data:
-                if item['currency_pair'] == f"{symbol}_USDT":
-                    high = float(item.get('high_24h', 0))
-                    low = float(item.get('low_24h', 0))
-                    if high > 0 and low > 0:
-                        volatility = ((high - low) / low) * 100
-                        volatility_cache[symbol] = (datetime.now(), volatility)
-                        return volatility
-        return 0
-    except:
-        return 0
+        formatted_symbol = symbol.replace('USDT', '_USDT')
+        url = f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={formatted_symbol}"
+        
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            if data:
+                return {
+                    'price': float(data[0]['last']),
+                    'change': float(data[0].get('change_percentage', 0)),
+                    'volume': float(data[0].get('quote_volume', 0))
+                }
+        return None
+    except Exception as e:
+        print(f"Ticker error for {symbol}: {e}")
+        return None
 
-def is_excluded_symbol(symbol):
-    if symbol.upper() in [s.upper() for s in STABLE_COINS]:
-        return True, "stable_coin"
-    if symbol.upper() in [s.upper() for s in SLOW_LARGE_COINS]:
-        return True, "slow_large"
-    return False, ""
+def get_all_symbols_gateio():
+    """جلب جميع العملات المتاحة على Gate.io"""
+    try:
+        url = "https://api.gateio.ws/api/v4/spot/currency_pairs"
+        with urllib.request.urlopen(url, timeout=15) as response:
+            data = json.loads(response.read().decode())
+            symbols = []
+            for pair in data:
+                if pair['quote'] == 'USDT' and pair['trade_status'] == 'tradable':
+                    symbol = pair['base'] + 'USDT'
+                    base = pair['base']
+                    # استبعاد العملات المستقرة
+                    if base not in STABLE_COINS:
+                        symbols.append(symbol)
+            return symbols[:MAX_SYMBOLS]
+    except Exception as e:
+        print(f"Error fetching symbols from Gate.io: {e}")
+        return []
 
-def calculate_score(symbol, data):
-    excluded, reason = is_excluded_symbol(symbol)
-    if excluded:
-        return 0, [f"Excluded: {reason}"]
+def calculate_rsi(prices, period=14):
+    """حساب RSI"""
+    if len(prices) < period + 1:
+        return 50
     
-    volatility = calculate_volatility(symbol)
-    if volatility < MIN_DAILY_VOLATILITY and volatility > 0:
-        return 0, [f"Low volatility ({volatility:.1f}%)"]
+    deltas = []
+    for i in range(1, len(prices)):
+        deltas.append(prices[i] - prices[i-1])
+    
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    if avg_loss == 0:
+        return 100
+    
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            return 100
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_ema(prices, period=20):
+    """حساب EMA"""
+    if len(prices) < period:
+        return prices[-1] if prices else 0
+    
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def calculate_macd(prices):
+    """حساب MACD (تقاطع بسيط)"""
+    if len(prices) < 26:
+        return False
+    
+    # EMA 12
+    ema12 = calculate_ema(prices, 12)
+    # EMA 26
+    ema26 = calculate_ema(prices, 26)
+    # MACD
+    macd = ema12 - ema26
+    
+    # حساب مؤشر MACD البسيط
+    macd_history = []
+    for i in range(26, len(prices)):
+        e12 = calculate_ema(prices[:i+1], 12)
+        e26 = calculate_ema(prices[:i+1], 26)
+        macd_history.append(e12 - e26)
+    
+    if len(macd_history) >= 9:
+        signal = calculate_ema(macd_history, 9)
+        return macd > signal
+    return False
+
+def calculate_score(symbol, klines, ticker):
+    """حساب السكور بناءً على المؤشرات"""
+    if not klines or len(klines) < 50:
+        return 0, []
+    
+    closes = [k['close'] for k in klines]
+    highs = [k['high'] for k in klines]
+    volumes = [k['volume'] for k in klines]
     
     score = 0
     reasons = []
     
-    if data['change'] > 8:
+    # 1. اختراق سعري (30 نقطة)
+    recent_highs = highs[-BREAKOUT_PERIOD-1:-1]
+    highest_recent = max(recent_highs) if recent_highs else 0
+    current_price = closes[-1]
+    
+    if current_price > highest_recent and highest_recent > 0:
+        breakout_pct = ((current_price - highest_recent) / highest_recent) * 100
         score += 30
-        reasons.append(f"Surge +{data['change']:.1f}%")
-    elif data['change'] > 5:
-        score += 25
-        reasons.append(f"Jump +{data['change']:.1f}%")
-    elif data['change'] > 3:
+        reasons.append(f"Breakout +{breakout_pct:.1f}%")
+    
+    # 2. انفجار حجم (25 نقطة)
+    avg_volume = sum(volumes[-VOLUME_PERIOD-1:-1]) / VOLUME_PERIOD if len(volumes) > VOLUME_PERIOD else 0
+    current_volume = volumes[-1]
+    
+    if avg_volume > 0:
+        volume_ratio = current_volume / avg_volume
+        if volume_ratio > 2:
+            score += 25
+            reasons.append(f"Volume x{volume_ratio:.1f}")
+        elif volume_ratio > 1.5:
+            score += 15
+            reasons.append(f"Volume x{volume_ratio:.1f}")
+        elif volume_ratio > 1.2:
+            score += 8
+            reasons.append(f"Volume x{volume_ratio:.1f}")
+    
+    # 3. الاتجاه (15 نقطة)
+    ema = calculate_ema(closes, EMA_PERIOD)
+    if current_price > ema:
         score += 15
-        reasons.append(f"Rise +{data['change']:.1f}%")
-    elif data['change'] > 1:
-        score += 10
-        reasons.append(f"Start +{data['change']:.1f}%")
+        reasons.append("Uptrend")
     
-    if data['volume'] > 5000000:
-        score += 30
-        reasons.append("Very high volume")
-    elif data['volume'] > 1000000:
-        score += 20
-        reasons.append("Good volume")
-    elif data['volume'] > 500000:
-        score += 10
-        reasons.append("Medium volume")
-    
-    if volatility > 10:
+    # 4. MACD (15 نقطة)
+    if calculate_macd(closes):
         score += 15
-        reasons.append(f"High volatility {volatility:.0f}%")
-    elif volatility > 7:
-        score += 10
-        reasons.append(f"Good volatility {volatility:.0f}%")
+        reasons.append("MACD Bullish")
     
-    if data['price'] < 0.5:
+    # 5. RSI (10 نقاط)
+    rsi = calculate_rsi(closes, RSI_PERIOD)
+    if 40 <= rsi <= 60:
         score += 10
-        reasons.append(f"Low price ${data['price']:.4f}")
-    elif data['price'] < 2:
+        reasons.append(f"RSI {rsi:.0f}")
+    elif 60 < rsi <= 75:
         score += 5
-        reasons.append(f"Good price ${data['price']:.4f}")
+        reasons.append(f"RSI {rsi:.0f}")
+    
+    # 6. التغير السعري (5 نقاط من التيكر)
+    if ticker and ticker['change'] > 3:
+        score += 5
+        reasons.append(f"Change +{ticker['change']:.1f}%")
     
     return min(score, 100), reasons
 
-# ============================================
-# المسح الضوئي
-# ============================================
-
-def scan_top10():
-    global scanning, last_scan_result
-    scanning = True
-    send_msg("Scanning market... Please wait 30-60 seconds")
+def scan_market():
+    """المسح الضوئي للسوق على Gate.io"""
+    print(f"\n{'='*50}")
+    print(f"🔄 Scanning Gate.io Market - {datetime.now().strftime('%H:%M:%S')}")
+    print(f"{'='*50}")
     
-    try:
-        prices = get_all_prices()
-        results = []
-        
-        for symbol, data in prices.items():
-            score, reasons = calculate_score(symbol, data)
-            if score >= 50:
-                results.append({
-                    'symbol': symbol,
-                    'score': score,
-                    'price': data['price'],
-                    'change': data['change'],
-                    'volume': data['volume'],
-                    'volatility': calculate_volatility(symbol),
-                    'reasons': reasons
-                })
-        
-        results.sort(key=lambda x: x['score'], reverse=True)
-        last_scan_result = results[:15]
-        save_top10_csv(last_scan_result)
-        show_top10_results()
-        scanning = False
-        return last_scan_result
-    except Exception as e:
-        send_msg(f"Scan error: {str(e)[:100]}")
-        scanning = False
-        return []
+    symbols = get_all_symbols_gateio()
+    print(f"📊 Found {len(symbols)} pairs on Gate.io")
+    
+    results = []
+    total_scanned = 0
+    
+    for i, symbol in enumerate(symbols):
+        try:
+            # جلب بيانات الشموع
+            klines = fetch_klines_gateio(symbol, '1h', 60)
+            ticker = fetch_ticker_gateio(symbol)
+            
+            if klines and ticker:
+                score, reasons = calculate_score(symbol, klines, ticker)
+                
+                if score >= MIN_SCORE:
+                    current_price = ticker['price']
+                    change = ticker['change']
+                    
+                    results.append({
+                        'symbol': symbol,
+                        'score': score,
+                        'price': current_price,
+                        'change': change,
+                        'reasons': reasons
+                    })
+                    print(f"  ✅ {symbol}: Score {score} | Change {change:+.1f}%")
+                    total_scanned += 1
+            
+            # تأخير لتجنب حظر API
+            time.sleep(0.3)
+            
+        except Exception as e:
+            print(f"Error scanning {symbol}: {e}")
+            continue
+    
+    # ترتيب حسب السكور
+    results.sort(key=lambda x: x['score'], reverse=True)
+    
+    print(f"\n📈 Found {len(results)} signals with score >= {MIN_SCORE}")
+    
+    # إرسال النتائج إلى Telegram
+    send_results_to_telegram(results[:15])
+    
+    return results
 
-def show_top10_results():
-    if not last_scan_result:
-        send_msg("No results. Use /scan first")
+def send_results_to_telegram(results):
+    """إرسال النتائج إلى Telegram"""
+    if not results:
+        send_telegram("🔍 No strong signals found on Gate.io in this scan.")
         return
     
-    message = "TOP COINS (Slow coins excluded)\n\n"
-    message += f"Excluded: coins with <{MIN_DAILY_VOLATILITY}% daily movement\n"
-    message += f"Excluded: stable coins\n\n"
+    message = f"🚀 <b>Gate.io Breakout Scanner</b> 🚀\n\n"
+    message += f"📊 Time: {datetime.now().strftime('%H:%M:%S')}\n"
+    message += f"🎯 Min Score: {MIN_SCORE}\n"
+    message += f"📈 Top {min(len(results), 10)} Signals\n\n"
     
-    for i, item in enumerate(last_scan_result[:10], 1):
-        change_emoji = "🟢" if item['change'] > 0 else "🔴"
-        message += f"{i}. {change_emoji} {item['symbol']}\n"
-        message += f"   Score: {item['score']} | Volatility: {item['volatility']:.1f}%\n"
-        message += f"   Price: ${item['price']:.4f} | Change: {item['change']:+.1f}%\n"
-        message += f"   {', '.join(item['reasons'][:2])}\n\n"
+    for i, r in enumerate(results[:10], 1):
+        change_emoji = "🟢" if r['change'] > 0 else "🔴"
+        message += f"{i}. {change_emoji} <b>{r['symbol']}</b>\n"
+        message += f"   Score: <code>{r['score']}</code> | Change: {r['change']:+.1f}%\n"
+        message += f"   Price: ${r['price']:.6f}\n"
+        message += f"   📊 {', '.join(r['reasons'][:3])}\n\n"
     
-    message += "To open trade: /buy SYMBOL\nExample: /buy SOL"
-    send_msg(message)
+    message += f"\n💡 Use /buy SYMBOL to open a trade\n"
+    message += f"🔄 Auto-scan every {SCAN_INTERVAL//60} minutes"
+    
+    send_telegram(message)
+    
+    # إرسال أفضل إشارة إلى القناة
+    if results:
+        best = results[0]
+        channel_msg = f"🏆 <b>Best Signal on Gate.io</b>\n\n{best['symbol']}\nScore: {best['score']}\nChange: {best['change']:+.1f}%\nPrice: ${best['price']:.6f}"
+        send_to_channel(channel_msg)
 
-def save_top10_csv(results):
-    with open(TOP10_FILE, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Rank', 'Symbol', 'Score', 'Price', 'Change%', 'Volatility%', 'Volume', 'Reasons', 'Time'])
-        for i, item in enumerate(results[:20], 1):
-            writer.writerow([
-                i, item['symbol'], item['score'], item['price'],
-                f"{item['change']:.2f}", f"{item['volatility']:.2f}",
-                f"{item['volume']:.0f}", '|'.join(item['reasons']),
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            ])
-
-# ============================================
-# إدارة الصفقات
-# ============================================
-
-def open_trade(symbol, price, score, reasons):
-    global balance, open_trades
-    if len(open_trades) >= MAX_OPEN_TRADES:
-        return False, f"Max trades reached ({MAX_OPEN_TRADES})"
-    if balance < TRADE_AMOUNT:
-        return False, f"Insufficient balance (${balance:.2f})"
-    if symbol in open_trades:
-        return False, f"Trade {symbol} already open"
+def start_auto_scanner():
+    """تشغيل الماسح التلقائي"""
+    print("🤖 Starting Gate.io Breakout Scanner...")
+    send_telegram("🤖 <b>Gate.io Breakout Scanner Started!</b>\n\n✅ Auto-scan every 5 minutes\n✅ 6 technical indicators\n✅ Real-time alerts")
     
-    trade = {
-        'id': f"{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        'symbol': symbol,
-        'entry_price': price,
-        'entry_time': datetime.now(),
-        'amount': TRADE_AMOUNT,
-        'quantity': TRADE_AMOUNT / price,
-        'score': score,
-        'reasons': reasons,
-        'highest': price,
-        'lowest': price,
-        'max_gain': 0,
-        'max_loss': 0,
-        'status': 'OPEN'
-    }
-    open_trades[symbol] = trade
-    balance -= TRADE_AMOUNT
-    save_trades_csv()
-    return True, trade
-
-def close_trade(symbol, reason="MANUAL"):
-    global balance, open_trades, closed_trades
-    if symbol not in open_trades:
-        return False, "Trade not found"
-    
-    trade = open_trades[symbol]
-    current_price = get_price(symbol)
-    if current_price == 0:
-        return False, "Cannot get current price"
-    
-    final_return = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-    profit_loss = (current_price - trade['entry_price']) * trade['quantity']
-    
-    trade['exit_price'] = current_price
-    trade['exit_time'] = datetime.now()
-    trade['final_return'] = final_return
-    trade['profit_loss'] = profit_loss
-    trade['exit_reason'] = reason
-    trade['status'] = 'CLOSED'
-    
-    closed_trades.append(trade)
-    del open_trades[symbol]
-    balance += trade['amount'] + profit_loss
-    save_trades_csv()
-    return True, trade
-
-def close_all_trades():
-    closed = []
-    for symbol in list(open_trades.keys()):
-        success, trade = close_trade(symbol, "CLOSE_ALL")
-        if success:
-            closed.append(trade)
-    return closed
-
-def get_portfolio_status():
-    total_value = balance
-    unrealized_pnl = 0
-    
-    for symbol, trade in open_trades.items():
-        current_price = get_price(symbol)
-        if current_price > 0:
-            current_value = trade['quantity'] * current_price
-            total_value += current_value
-            unrealized_pnl += (current_value - trade['amount'])
-            if current_price > trade['highest']:
-                trade['highest'] = current_price
-                trade['max_gain'] = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-            if current_price < trade['lowest']:
-                trade['lowest'] = current_price
-                trade['max_loss'] = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-    
-    realized_pnl = sum(t.get('profit_loss', 0) for t in closed_trades)
-    total_pnl = realized_pnl + unrealized_pnl
-    winning_trades = len([t for t in closed_trades if t.get('final_return', 0) > 0])
-    win_rate = (winning_trades / len(closed_trades) * 100) if closed_trades else 0
-    
-    return {
-        'balance': balance,
-        'total_value': total_value,
-        'invested': INITIAL_BALANCE - balance,
-        'realized_pnl': realized_pnl,
-        'unrealized_pnl': unrealized_pnl,
-        'total_pnl': total_pnl,
-        'total_return_pct': (total_pnl / INITIAL_BALANCE) * 100,
-        'open_trades': len(open_trades),
-        'closed_trades': len(closed_trades),
-        'win_rate': win_rate
-    }
-
-def save_trades_csv():
-    with open(TRADES_FILE, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Type', 'ID', 'Symbol', 'Entry Price', 'Entry Time', 'Amount', 
-                        'Quantity', 'Exit Price', 'Exit Time', 'Return%', 'Profit/Loss', 
-                        'Exit Reason', 'Status'])
-        
-        for trade in open_trades.values():
-            writer.writerow([
-                'OPEN', trade['id'], trade['symbol'], trade['entry_price'],
-                trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S'), trade['amount'],
-                trade['quantity'], '-', '-', '-', '-', '-', 'OPEN'
-            ])
-        
-        for trade in closed_trades:
-            writer.writerow([
-                'CLOSED', trade['id'], trade['symbol'], trade['entry_price'],
-                trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S'), trade['amount'],
-                trade['quantity'], trade.get('exit_price', '-'),
-                trade.get('exit_time', datetime.now()).strftime('%Y-%m-%d %H:%M:%S'),
-                f"{trade.get('final_return', 0):.2f}",
-                f"{trade.get('profit_loss', 0):.2f}",
-                trade.get('exit_reason', '-'), 'CLOSED'
-            ])
-    
-    status = get_portfolio_status()
-    with open(PORTFOLIO_FILE, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Time', 'Balance', 'Total Value', 'Realized PnL', 'Unrealized PnL', 
-                        'Total PnL', 'Return%', 'Open Trades', 'Closed Trades', 'Win Rate%'])
-        writer.writerow([
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            f"{status['balance']:.2f}", f"{status['total_value']:.2f}",
-            f"{status['realized_pnl']:.2f}", f"{status['unrealized_pnl']:.2f}",
-            f"{status['total_pnl']:.2f}", f"{status['total_return_pct']:.2f}",
-            status['open_trades'], status['closed_trades'], f"{status['win_rate']:.2f}"
-        ])
-
-def monitor_open_trades():
-    for symbol in list(open_trades.keys()):
+    while True:
         try:
-            current_price = get_price(symbol)
-            if current_price == 0:
-                continue
-            
-            trade = open_trades[symbol]
-            current_return = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-            
-            if current_price > trade['highest']:
-                trade['highest'] = current_price
-                trade['max_gain'] = current_return
-            
-            should_close = False
-            reason = ""
-            
-            if current_return >= PROFIT_TARGET:
-                should_close = True
-                reason = "TP_HIT"
-            elif current_return <= STOP_LOSS:
-                should_close = True
-                reason = "SL_HIT"
-            elif current_return >= TRAILING_STOP_ACTIVATION:
-                trailing_stop = trade['highest'] * (1 - TRAILING_STOP_DISTANCE / 100)
-                if current_price <= trailing_stop:
-                    should_close = True
-                    reason = "TRAILING_STOP"
-            
-            if should_close:
-                success, closed_trade = close_trade(symbol, reason)
-                if success:
-                    emoji = "✅" if closed_trade['final_return'] >= 0 else "❌"
-                    send_msg(f"""{emoji} Trade closed {closed_trade['symbol']}
-
-Return: {closed_trade['final_return']:+.2f}%
-Profit: ${closed_trade['profit_loss']:+.2f}
-Max gain: +{closed_trade.get('max_gain', 0):.1f}%
-Reason: {reason}
-Duration: {((closed_trade['exit_time'] - closed_trade['entry_time']).total_seconds() / 60):.0f} min""")
-                    
-                    if closed_trade['final_return'] >= 3:
-                        send_to_channel(f"✅ Profit {closed_trade['symbol']}\n+{closed_trade['final_return']:.1f}% (${closed_trade['profit_loss']:.2f})")
+            scan_market()
+            print(f"⏳ Waiting {SCAN_INTERVAL//60} minutes until next scan...")
+            time.sleep(SCAN_INTERVAL)
         except Exception as e:
-            print(f"Monitor error for {symbol}: {e}")
-
-def start_monitoring():
-    while bot_running:
-        try:
-            monitor_open_trades()
-            current_hour = datetime.now().hour
-            if current_hour == 0 and datetime.now().minute < 5:
-                status = get_portfolio_status()
-                send_msg(f"""Daily Report
-
-Balance: ${status['balance']:.2f}
-Total PnL: ${status['total_pnl']:+.2f}
-Return: {status['total_return_pct']:+.1f}%
-Open trades: {status['open_trades']}
-Closed trades: {status['closed_trades']}
-Win rate: {status['win_rate']:.1f}%
-
-{datetime.now().strftime('%Y-%m-%d')}""")
-            time.sleep(60)
-        except Exception as e:
-            print(f"Monitoring loop error: {e}")
+            print(f"Scanner error: {e}")
             time.sleep(60)
 
-# ============================================
-# معالجة أوامر Telegram
-# ============================================
-
-def get_updates(offset=None):
-    try:
-        url = f'https://api.telegram.org/bot{TOKEN}/getUpdates'
-        if offset:
-            url += f'?offset={offset}'
-        with urllib.request.urlopen(url, timeout=30) as r:
-            return json.loads(r.read().decode())
-    except:
-        return {'result': []}
-
-def handle_commands():
-    global last_update_id, bot_running
+def handle_telegram_commands():
+    """معالجة أوامر Telegram"""
+    last_id = 0
     
-    while bot_running:
+    while True:
         try:
-            updates = get_updates(last_update_id + 1)
+            url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates'
+            if last_id:
+                url += f'?offset={last_id + 1}'
             
-            for update in updates.get('result', []):
-                last_update_id = update['update_id']
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = json.loads(r.read().decode())
+            
+            for update in data.get('result', []):
+                last_id = update['update_id']
                 message = update.get('message', {})
                 text = message.get('text', '').lower()
                 user_id = message.get('chat', {}).get('id')
                 
                 if text == '/start':
-                    msg = """🤖 Trading Bot - Light Version
+                    msg = """🤖 <b>Gate.io Breakout Scanner</b>
 
-Features:
-- Excludes stable and slow coins
-- Score system (0-100)
-- Virtual portfolio $1000
-- Trailing Stop Loss
-- Full Telegram control
+<b>Features:</b>
+✅ Scans 500+ pairs on Gate.io
+✅ 6 technical indicators
+✅ Breakout + Volume confirmation
+✅ MACD + RSI + EMA filters
+✅ Real-time alerts via Telegram
 
-Commands:
-/scan - Scan market
-/portfolio - Show portfolio
-/trades - Trade history
-/buy SYMBOL - Open trade
-/close SYMBOL - Close trade
-/closeall - Close all trades
-/status - Bot status
-/export - Download CSV files
+<b>Commands:</b>
+/scan - Run manual scan
+/status - Scanner status
 /help - Help
 
-Example: /buy SOL"""
-                    send_msg(msg, user_id)
-                
-                elif text == '/help':
-                    msg = """Commands Guide
-
-Scan:
-/scan - Scan market for top coins
-
-Trading:
-/buy SOL - Open buy trade
-/close SOL - Close trade
-/closeall - Close all trades
-
-Portfolio:
-/portfolio - Portfolio details
-/trades - Trade history
-/status - Bot status
-
-Files:
-/export - Download CSV files
-
-Score system:
-80-100: Excellent
-60-80: Very good
-50-60: Good"""
-                    send_msg(msg, user_id)
+<b>Auto-scan:</b>
+Every 5 minutes automatically"""
+                    send_telegram(msg)
                 
                 elif text == '/scan':
-                    if scanning:
-                        send_msg("Scan already in progress, please wait", user_id)
-                    else:
-                        threading.Thread(target=scan_top10, daemon=True).start()
+                    send_telegram("🔄 Manual scan started on Gate.io...")
+                    threading.Thread(target=scan_market, daemon=True).start()
                 
                 elif text == '/status':
-                    btc = get_price('BTC')
-                    eth = get_price('ETH')
-                    status = get_portfolio_status()
-                    msg = f"""Bot Status
+                    msg = f"""📊 <b>Gate.io Scanner Status</b>
 
-Time: {datetime.now().strftime('%H:%M:%S')}
+✅ Status: Active
+📈 Max pairs: {MAX_SYMBOLS}
+🎯 Min score: {MIN_SCORE}
+⏱️ Interval: {SCAN_INTERVAL//60} min
+🔧 Indicators: 6 active
+🏦 Exchange: Gate.io
 
-Prices:
-BTC: ${btc:,.0f}
-ETH: ${eth:,.0f}
-
-Portfolio:
-Balance: ${status['balance']:.2f}
-Total PnL: ${status['total_pnl']:+.2f}
-Return: {status['total_return_pct']:+.1f}%
-
-Trades:
-Open: {status['open_trades']}/{MAX_OPEN_TRADES}
-Closed: {status['closed_trades']}
-Win rate: {status['win_rate']:.1f}%"""
-                    send_msg(msg, user_id)
+📅 Last update: {datetime.now().strftime('%H:%M:%S')}"""
+                    send_telegram(msg)
                 
-                elif text == '/portfolio':
-                    status = get_portfolio_status()
-                    msg = f"""Portfolio Details
+                elif text == '/help':
+                    msg = """📚 <b>Gate.io Scanner Help</b>
 
-Balance: ${status['balance']:.2f}
-Total Value: ${status['total_value']:.2f}
-Total PnL: ${status['total_pnl']:+.2f}
-Return: {status['total_return_pct']:+.1f}%
+<b>How it works:</b>
+1. Scans all USDT pairs on Gate.io
+2. Analyzes 6 technical indicators
+3. Calculates confidence score (0-100)
+4. Sends top signals to Telegram
 
-Open Trades ({status['open_trades']}):"""
-                    
-                    if open_trades:
-                        for symbol, trade in open_trades.items():
-                            current_price = get_price(symbol)
-                            if current_price > 0:
-                                pnl = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-                                msg += f"\n• {symbol}: {pnl:+.1f}% (Entry ${trade['entry_price']:.4f})"
-                    else:
-                        msg += "\nNo open trades"
-                    
-                    msg += f"\n\nClosed Trades: {status['closed_trades']}"
-                    msg += f"\nWin Rate: {status['win_rate']:.1f}%"
-                    send_msg(msg, user_id)
-                
-                elif text == '/trades':
-                    if not closed_trades:
-                        send_msg("No closed trades yet", user_id)
-                    else:
-                        msg = "Last 10 Closed Trades\n\n"
-                        for trade in closed_trades[-10:]:
-                            emoji = "✅" if trade.get('final_return', 0) > 0 else "❌"
-                            msg += f"{emoji} {trade['symbol']}\n"
-                            msg += f"   Return: {trade.get('final_return', 0):+.1f}%\n"
-                            msg += f"   Profit: ${trade.get('profit_loss', 0):+.2f}\n"
-                            msg += f"   Exit: {trade.get('exit_reason', '-')}\n\n"
-                        send_msg(msg, user_id)
-                
-                elif text.startswith('/buy'):
-                    parts = text.split()
-                    if len(parts) < 2:
-                        send_msg("Usage: /buy SYMBOL\nExample: /buy SOL", user_id)
-                    else:
-                        symbol = parts[1].upper()
-                        found = None
-                        for item in last_scan_result:
-                            if item['symbol'] == symbol:
-                                found = item
-                                break
-                        
-                        if not found:
-                            send_msg(f"Symbol {symbol} not found in scan results\nUse /scan first", user_id)
-                        else:
-                            success, result = open_trade(symbol, found['price'], found['score'], found['reasons'])
-                            if success:
-                                msg = f"""Trade opened!
+<b>Indicators used:</b>
+- Price Breakout (30 pts)
+- Volume Explosion (25 pts)
+- Trend (EMA) (15 pts)
+- MACD (15 pts)
+- RSI (10 pts)
+- Price Change (5 pts)
 
-{symbol}
-Price: ${found['price']:.4f}
-Score: {found['score']}
-Amount: ${TRADE_AMOUNT}
-
-Target: +{PROFIT_TARGET}%
-Stop Loss: {STOP_LOSS}%
-Trailing: after +{TRAILING_STOP_ACTIVATION}% (distance {TRAILING_STOP_DISTANCE}%)"""
-                                send_msg(msg, user_id)
-                                send_to_channel(f"New trade\n{symbol}\nPrice: ${found['price']:.4f}\nScore: {found['score']}")
-                            else:
-                                send_msg(f"Failed: {result}", user_id)
-                
-                elif text.startswith('/close'):
-                    parts = text.split()
-                    if len(parts) < 2:
-                        send_msg("Usage: /close SYMBOL\nExample: /close SOL", user_id)
-                    else:
-                        symbol = parts[1].upper()
-                        success, result = close_trade(symbol, "USER_COMMAND")
-                        if success:
-                            emoji = "✅" if result['final_return'] >= 0 else "❌"
-                            send_msg(f"{emoji} Trade closed {symbol}\nReturn: {result['final_return']:+.1f}%\nProfit: ${result['profit_loss']:+.2f}", user_id)
-                        else:
-                            send_msg(f"Failed: {result}", user_id)
-                
-                elif text == '/closeall':
-                    closed = close_all_trades()
-                    if closed:
-                        total_pnl = sum(t.get('profit_loss', 0) for t in closed)
-                        send_msg(f"Closed all trades ({len(closed)})\nTotal PnL: ${total_pnl:+.2f}", user_id)
-                    else:
-                        send_msg("No open trades to close", user_id)
-                
-                elif text == '/export':
-                    save_trades_csv()
-                    files = [TOP10_FILE, TRADES_FILE, PORTFOLIO_FILE]
-                    sent = False
-                    for file in files:
-                        if os.path.exists(file) and os.path.getsize(file) > 0:
-                            try:
-                                url = f'https://api.telegram.org/bot{TOKEN}/sendDocument'
-                                with open(file, 'rb') as f:
-                                    data = f.read()
-                                boundary = '----WebKitFormBoundary' + str(time.time())
-                                body = (
-                                    f'--{boundary}\r\n'
-                                    f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{user_id}\r\n'
-                                    f'--{boundary}\r\n'
-                                    f'Content-Disposition: form-data; name="document"; filename="{file}"\r\n'
-                                    f'Content-Type: text/csv\r\n\r\n'
-                                ).encode() + data + f'\r\n--{boundary}--\r\n'.encode()
-                                headers = {'Content-Type': f'multipart/form-data; boundary={boundary}'}
-                                req = urllib.request.Request(url, data=body, headers=headers, method='POST')
-                                urllib.request.urlopen(req, timeout=30)
-                                sent = True
-                                time.sleep(1)
-                            except Exception as e:
-                                print(f"Error sending {file}: {e}")
-                    if sent:
-                        send_msg("CSV files sent:\n- top10.csv\n- trades.csv\n- portfolio.csv", user_id)
-                    else:
-                        send_msg("No CSV files to send", user_id)
+<b>Score interpretation:</b>
+80-100: Excellent signal
+65-79: Good signal
+60-64: Weak signal"""
+                    send_telegram(msg)
                 
                 elif text == '/ping':
-                    send_msg("Pong! Bot is running", user_id)
+                    send_telegram("🏓 Pong! Gate.io scanner is running")
                 
                 else:
                     if text and not text.startswith('/'):
-                        send_msg(f"Unknown command: {text}\nUse /help", user_id)
+                        send_telegram(f"❓ Unknown command: {text}\nUse /help", user_id)
             
             time.sleep(1)
         except Exception as e:
@@ -702,16 +468,21 @@ Trailing: after +{TRAILING_STOP_ACTIVATION}% (distance {TRAILING_STOP_DISTANCE}%
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("STARTING TRADING BOT (TELEGRAM ONLY)")
+    print("🚀 STARTING GATE.IO BREAKOUT SCANNER")
     print("=" * 50)
     print(f"Time: {datetime.now()}")
-    print(f"Balance: ${INITIAL_BALANCE}")
-    print(f"Max trades: {MAX_OPEN_TRADES}")
+    print(f"Exchange: Gate.io")
+    print(f"Max pairs: {MAX_SYMBOLS}")
+    print(f"Min score: {MIN_SCORE}")
+    print(f"Scan interval: {SCAN_INTERVAL//60} minutes")
     print("=" * 50)
     
-    send_msg("Bot is running!\n\nUse /scan to start scanning\nUse /help for commands")
+    # إرسال رسالة بدء التشغيل
+    send_telegram("🚀 <b>Gate.io Breakout Scanner Started!</b>\n\n✅ Connected to Gate.io API\n✅ Auto-scan every 5 minutes\n✅ Sending signals to this chat")
     
-    monitor_thread = threading.Thread(target=start_monitoring, daemon=True)
-    monitor_thread.start()
+    # تشغيل الماسح في thread منفصل
+    scanner_thread = threading.Thread(target=start_auto_scanner, daemon=True)
+    scanner_thread.start()
     
-    handle_commands()
+    # تشغيل معالجة الأوامر
+    handle_telegram_commands()
