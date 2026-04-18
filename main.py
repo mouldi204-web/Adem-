@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gate.io Auto Trading Bot - Advanced Filtering Pipeline + Multi-Timeframe
+Gate.io Auto Trading Bot - Final Working Version
 """
 
 import os
@@ -40,13 +40,12 @@ BATCH_SIZE = 100
 BATCH_DELAY = 10
 SYMBOL_DELAY = 0.2
 
-# قائمة الشروط الأساسية (قبل حساب السكور)
 PRECONDITIONS = {
-    'min_price': 0.01,           # السعر > 0.01$
-    'min_volume': 1_000_000,     # حجم التداول > 1M$
-    'min_change': 1.0,           # التغير > 1%
-    'max_change': 30.0,          # التغير < 30% (تجنب القفزات المفرطة)
-    'min_liquidity': 0.001,      # السيولة (spread < 0.1%)
+    'min_price': 0.01,
+    'min_volume': 1_000_000,
+    'min_change': 1.0,
+    'max_change': 30.0,
+    'min_liquidity': 0.001,
 }
 
 # ================== GLOBALS ==================
@@ -102,7 +101,6 @@ def get_24h_data(symbol):
         return None
 
 def get_all_symbols():
-    """جلب قائمة بجميع العملات المتاحة على Gate.io"""
     try:
         markets = exchange.load_markets()
         symbols = [s.replace('/USDT', '') for s in markets if s.endswith('/USDT')]
@@ -116,12 +114,48 @@ def fetch_ohlcv(symbol, timeframe='1h', limit=100):
     except:
         return []
 
-# ================== MULTI-TIMEFRAME ANALYSIS ==================
-def get_trend(tf_ohlcv):
-    """تحديد الاتجاه من بيانات OHLCV: 1 = صاعد، -1 = هابط، 0 = جانبي"""
-    if not tf_ohlcv or len(tf_ohlcv) < 50:
+# ================== TECHNICAL INDICATORS ==================
+def calculate_rsi(ohlcv, period=14):
+    closes = [c[4] for c in ohlcv]
+    if len(closes) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(ohlcv, fast=12, slow=26):
+    closes = [c[4] for c in ohlcv]
+    if len(closes) < slow:
+        return 0, 0
+    ema_fast = sum(closes[-fast:]) / fast
+    ema_slow = sum(closes[-slow:]) / slow
+    return ema_fast - ema_slow, 0
+
+def calculate_bb_width(ohlcv, period=20):
+    closes = [c[4] for c in ohlcv[-period:]]
+    if len(closes) < period:
+        return 0.1
+    mean = sum(closes) / period
+    variance = sum((x - mean) ** 2 for x in closes) / period
+    std = variance ** 0.5
+    return (mean + 2*std - (mean - 2*std)) / mean if mean != 0 else 0.1
+
+def get_trend(ohlcv):
+    if not ohlcv or len(ohlcv) < 50:
         return 0
-    closes = [c[4] for c in tf_ohlcv]
+    closes = [c[4] for c in ohlcv]
     ema20 = sum(closes[-20:]) / 20
     ema50 = sum(closes[-50:]) / 50
     if closes[-1] > ema20 > ema50:
@@ -131,19 +165,13 @@ def get_trend(tf_ohlcv):
     return 0
 
 def get_support_resistance(ohlcv, current_price):
-    """إيجاد أقرب دعم ومقاومة من آخر 50 شمعة"""
     if not ohlcv or len(ohlcv) < 50:
         return None, None
     highs = [c[2] for c in ohlcv[-50:]]
     lows = [c[3] for c in ohlcv[-50:]]
-    resistance = max(highs)
-    support = min(lows)
-    # البحث عن أقرب دعم أعلى من السعر بقليل وأقرب مقاومة أقل من السعر بقليل
     supports = sorted([l for l in lows if l < current_price], reverse=True)
     resistances = sorted([h for h in highs if h > current_price])
-    nearest_support = supports[0] if supports else support
-    nearest_resistance = resistances[0] if resistances else resistance
-    return nearest_support, nearest_resistance
+    return supports[0] if supports else None, resistances[0] if resistances else None
 
 def calculate_atr(ohlcv, period=14):
     if not ohlcv or len(ohlcv) < period+1:
@@ -155,19 +183,15 @@ def calculate_atr(ohlcv, period=14):
         prev_close = ohlcv[i-1][4]
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         tr_values.append(tr)
-    atr = sum(tr_values[-period:]) / period
-    return atr
+    return sum(tr_values[-period:]) / period
 
 # ================== PRECISE ENTRY & TP/SL ==================
-def calculate_precise_entry(symbol, current_price, ohlcv_1h, ohlcv_4h):
-    """حساب نقطة دخول دقيقة بناءً على الدعم القريب"""
+def calculate_precise_entry(current_price, ohlcv_1h, ohlcv_4h):
     support_1h, _ = get_support_resistance(ohlcv_1h, current_price)
     support_4h, _ = get_support_resistance(ohlcv_4h, current_price)
-    # خذ أقرب دعم (الأعلى)
     supports = [s for s in [support_1h, support_4h] if s is not None and s < current_price]
     if supports:
         best_support = max(supports)
-        # إذا كان السعر قريباً من الدعم (< 1%)، نستخدم السعر الحالي، وإلا ننتظر الدعم
         if (current_price - best_support) / current_price < 0.01:
             entry = current_price
         else:
@@ -177,47 +201,20 @@ def calculate_precise_entry(symbol, current_price, ohlcv_1h, ohlcv_4h):
     return entry
 
 def calculate_dynamic_tp_sl(entry_price, atr, support, resistance):
-    """تحديد جني أرباح ووقف خسارة ديناميكي بناءً على ATR والمقاومة"""
-    # وقف الخسارة: 1.5 × ATR أو 3% أيهما أقل، مع مراعاة الدعم
-    sl_distance = min(1.5 * (atr / entry_price), 0.03)  # بحد أقصى 3%
+    sl_distance = min(1.5 * (atr / entry_price), 0.03)
     sl_price = entry_price * (1 - sl_distance)
-    # إذا كان هناك دعم قريب، نضع الوقف تحته بقليل
     if support and support > sl_price:
         sl_price = support * 0.99
-    # جني أرباح المستوى الأول: أقرب مقاومة أو 1.5 × ATR
     if resistance and resistance > entry_price:
-        tp1 = min(resistance, entry_price * (1 + 0.03))
+        tp1 = min(resistance, entry_price * 1.03)
     else:
-        tp1 = entry_price * (1 + 0.03)
-    tp2 = entry_price * (1 + 0.06)
-    tp3 = entry_price * (1 + 0.10)
+        tp1 = entry_price * 1.03
+    tp2 = entry_price * 1.06
+    tp3 = entry_price * 1.10
     return [tp1, tp2, tp3], sl_price
 
-# ================== FILTERING PIPELINE (PRECONDITIONS) ==================
-def passes_prefilter(symbol, ticker_data):
-    """التحقق من الشروط الأساسية قبل حساب السكور"""
-    price = ticker_data['price']
-    change = ticker_data['change']
-    volume = ticker_data['volume']
-    bid = ticker_data.get('bid', price)
-    ask = ticker_data.get('ask', price)
-
-    if price < PRECONDITIONS['min_price']:
-        return False, f"price {price:.4f} < {PRECONDITIONS['min_price']}"
-    if volume < PRECONDITIONS['min_volume']:
-        return False, f"volume {volume/1e6:.1f}M < {PRECONDITIONS['min_volume']/1e6}M"
-    if change < PRECONDITIONS['min_change']:
-        return False, f"change {change:.1f}% < {PRECONDITIONS['min_change']}%"
-    if change > PRECONDITIONS['max_change']:
-        return False, f"change {change:.1f}% > {PRECONDITIONS['max_change']}%"
-    if bid > 0 and ask > 0:
-        spread = (ask - bid) / bid
-        if spread > PRECONDITIONS['min_liquidity']:
-            return False, f"spread {spread:.2%} > {PRECONDITIONS['min_liquidity']:.1%}"
-    return True, "OK"
-
-# ================== ENHANCED SCORE (MULTI-TIMEFRAME) ==================
-def calculate_score_mtf(symbol, ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change=None, coin_win_rate=None):
+# ================== SCORING (MULTI-TIMEFRAME) ==================
+def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, coin_win_rate):
     score = 0
     price = ticker_data['price']
     change = ticker_data['change']
@@ -225,7 +222,6 @@ def calculate_score_mtf(symbol, ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_
     high = ticker_data['high']
     low = ticker_data['low']
 
-    # ---- 1. الزخم السعري (15 نقطة) ----
     if change > 10: score += 15
     elif change > 8: score += 12
     elif change > 6: score += 9
@@ -233,21 +229,18 @@ def calculate_score_mtf(symbol, ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_
     elif change > 2: score += 3
     elif change > 1: score += 1
 
-    # ---- 2. حجم التداول (10 نقاط) ----
     if volume > 200_000_000: score += 10
     elif volume > 100_000_000: score += 8
     elif volume > 50_000_000: score += 6
     elif volume > 20_000_000: score += 4
     elif volume > 10_000_000: score += 2
 
-    # ---- 3. السعر المنخفض (8 نقاط) ----
     if price < 0.05: score += 8
     elif price < 0.1: score += 6
     elif price < 0.5: score += 4
     elif price < 1: score += 2
     elif price < 2: score += 1
 
-    # ---- 4. التقلب (5 نقاط) ----
     if high > 0 and low > 0:
         volatility = ((high - low) / low) * 100
         if 5 <= volatility <= MAX_VOLATILITY:
@@ -255,7 +248,6 @@ def calculate_score_mtf(symbol, ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_
         elif volatility > MAX_VOLATILITY:
             score -= 5
 
-    # ---- 5. الحجم النسبي (5 نقاط) ----
     if ohlcv_1h and len(ohlcv_1h) >= 20:
         volumes = [c[5] for c in ohlcv_1h[-21:-1]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 1
@@ -264,81 +256,41 @@ def calculate_score_mtf(symbol, ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_
         elif vol_ratio > 1.5: score += 3
         elif vol_ratio > 1.2: score += 1
 
-    # ---- 6. الاتجاه متعدد الأطر (10 نقاط) ----
     trend_15m = get_trend(ohlcv_15m)
     trend_1h = get_trend(ohlcv_1h)
     trend_4h = get_trend(ohlcv_4h)
     bullish_count = sum([1 for t in [trend_15m, trend_1h, trend_4h] if t == 1])
-    if bullish_count >= 2:
-        score += 10
-    elif bullish_count == 1:
-        score += 5
+    if bullish_count >= 2: score += 10
+    elif bullish_count == 1: score += 5
 
-    # ---- 7. RSI (5 نقاط) ----
     if ohlcv_1h and len(ohlcv_1h) >= 15:
         rsi = calculate_rsi(ohlcv_1h)
         if 30 <= rsi <= 50: score += 5
         elif rsi > 70: score -= 5
 
-    # ---- 8. MACD (5 نقاط) ----
     if ohlcv_1h and len(ohlcv_1h) >= 26:
         macd, _ = calculate_macd(ohlcv_1h)
         if macd > 0: score += 5
 
-    # ---- 9. Bollinger Squeeze (3 نقاط) ----
     if ohlcv_1h and len(ohlcv_1h) >= 20:
         if calculate_bb_width(ohlcv_1h) < 0.05: score += 3
 
-    # ---- 10. تصنيف العملة السابق (4 نقاط) ----
     if coin_win_rate is not None:
         if coin_win_rate > 70: score += 4
         elif coin_win_rate > 60: score += 2
         elif coin_win_rate > 50: score += 1
 
-    # ---- 11. تأثير البيتكوين (عامل ضرب) ----
     if btc_change is not None:
         if btc_change < -2: score = score * 0.7
         elif btc_change > 2: score = score * 1.1
 
-    # ---- 12. وقت التداول (عامل ضرب) ----
     hour = datetime.now().hour
     if hour < ACTIVE_HOURS_START or hour > ACTIVE_HOURS_END:
         score = score * 0.8
 
     return max(0, min(100, int(score)))
 
-# Helper indicators (same as before)
-def calculate_rsi(ohlcv, period=14):
-    closes = [c[4] for c in ohlcv]
-    if len(closes) < period + 1: return 50
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        if diff > 0:
-            gains.append(diff); losses.append(0)
-        else:
-            gains.append(0); losses.append(abs(diff))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0: return 100
-    return 100 - (100 / (1 + (avg_gain / avg_loss)))
-
-def calculate_macd(ohlcv, fast=12, slow=26):
-    closes = [c[4] for c in ohlcv]
-    if len(closes) < slow: return 0, 0
-    ema_fast = sum(closes[-fast:]) / fast
-    ema_slow = sum(closes[-slow:]) / slow
-    return ema_fast - ema_slow, 0
-
-def calculate_bb_width(ohlcv, period=20):
-    closes = [c[4] for c in ohlcv[-period:]]
-    if len(closes) < period: return 0.1
-    mean = sum(closes) / period
-    variance = sum((x - mean) ** 2 for x in closes) / period
-    std = variance ** 0.5
-    return (mean + 2*std - (mean - 2*std)) / mean if mean != 0 else 0.1
-
-# ================== TRADING LOGIC (same as before, but using dynamic TP/SL) ==================
+# ================== TRADING LOGIC ==================
 def get_position_size(score, volatility=None):
     base = 50
     if score >= 90: size = base * 1.5
@@ -424,18 +376,15 @@ def monitor_trades():
         ret = ((cur - trade['entry_price']) / trade['entry_price']) * 100
         if cur > trade['highest']: trade['highest'] = cur
 
-        # Hard stop loss
         if cur <= trade['sl_price']:
             close_trade(sym, "SL", 1.0)
             send_telegram(f"❌ SL {sym} | Return: {ret:+.2f}%")
             continue
 
-        # Breakeven
         if not trade.get('breakeven_activated') and ret >= BREAKEVEN_ACTIVATION:
             trade['breakeven_activated'] = True
             send_telegram(f"🔒 Breakeven activated for {sym}")
 
-        # Take profits
         for i, tp in enumerate(trade['tp_levels']):
             if trade.get('targets_hit', 0) <= i and cur >= tp:
                 close_percent = PROFIT_TARGET_PARTS[i]
@@ -444,7 +393,6 @@ def monitor_trades():
                 send_telegram(f"✅ TP {PROFIT_TARGETS[i]}% hit for {sym} | Closed {close_percent*100:.0f}%")
                 break
 
-        # Trailing stop (for remaining part)
         if sym in open_trades:
             trade = open_trades[sym]
             if sym not in trailing:
@@ -458,7 +406,28 @@ def monitor_trades():
                 elif cur > trade['highest']:
                     trailing[sym] = cur * (1 - TRAILING_STOP_DISTANCE / 100)
 
-# ================== BATCH SCAN WITH FILTERING PIPELINE ==================
+# ================== SCAN PIPELINE ==================
+def passes_prefilter(symbol, ticker_data):
+    price = ticker_data['price']
+    change = ticker_data['change']
+    volume = ticker_data['volume']
+    bid = ticker_data.get('bid', price)
+    ask = ticker_data.get('ask', price)
+
+    if price < PRECONDITIONS['min_price']:
+        return False, f"price {price:.4f} < {PRECONDITIONS['min_price']}"
+    if volume < PRECONDITIONS['min_volume']:
+        return False, f"volume {volume/1e6:.1f}M < {PRECONDITIONS['min_volume']/1e6}M"
+    if change < PRECONDITIONS['min_change']:
+        return False, f"change {change:.1f}% < {PRECONDITIONS['min_change']}%"
+    if change > PRECONDITIONS['max_change']:
+        return False, f"change {change:.1f}% > {PRECONDITIONS['max_change']}%"
+    if bid > 0 and ask > 0:
+        spread = (ask - bid) / bid
+        if spread > PRECONDITIONS['min_liquidity']:
+            return False, f"spread {spread:.2%} > {PRECONDITIONS['min_liquidity']:.1%}"
+    return True, "OK"
+
 def scan_and_trade():
     global scanning, detected_coins
     if not check_daily_loss():
@@ -482,32 +451,23 @@ def scan_and_trade():
             batch = all_symbols[batch_start:batch_start+BATCH_SIZE]
             for symbol in batch:
                 try:
-                    # 1. جلب بيانات 24 ساعة
                     ticker_data = get_24h_data(symbol)
-                    if not ticker_data:
-                        continue
-                    # 2. الشروط الأساسية
-                    passed, reason = passes_prefilter(symbol, ticker_data)
-                    if not passed:
-                        continue
-                    # 3. جلب بيانات الفريمات المتعددة (15m, 1h, 4h)
+                    if not ticker_data: continue
+                    passed, _ = passes_prefilter(symbol, ticker_data)
+                    if not passed: continue
                     ohlcv_15m = fetch_ohlcv(symbol, '15m', 100)
                     ohlcv_1h = fetch_ohlcv(symbol, '1h', 100)
                     ohlcv_4h = fetch_ohlcv(symbol, '4h', 100)
-                    if not ohlcv_1h or len(ohlcv_1h) < 50:
-                        continue
-                    # 4. حساب السكور
+                    if not ohlcv_1h or len(ohlcv_1h) < 50: continue
                     win_rate = coin_history.get(symbol, {}).get('win_rate', 50)
-                    score = calculate_score_mtf(symbol, ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, win_rate)
+                    score = calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, win_rate)
                     if score >= MIN_SCORE_TO_TRADE:
-                        # 5. حساب نقطة دخول دقيقة و TP/SL
-                        entry_price = calculate_precise_entry(symbol, ticker_data['price'], ohlcv_1h, ohlcv_4h)
+                        entry_price = calculate_precise_entry(ticker_data['price'], ohlcv_1h, ohlcv_4h)
                         atr = calculate_atr(ohlcv_1h)
                         support, resistance = get_support_resistance(ohlcv_1h, entry_price)
                         tp_levels, sl_price = calculate_dynamic_tp_sl(entry_price, atr, support, resistance)
                         volatility = ((ticker_data['high'] - ticker_data['low']) / ticker_data['low']) * 100 if ticker_data['low']>0 else 0
                         candidates.append((symbol, entry_price, score, volatility, tp_levels, sl_price))
-                        # تخزين في detected_coins
                         if symbol not in detected_coins or score > detected_coins[symbol].get('best_score',0):
                             detected_coins[symbol] = {"best_score": score, "best_price": entry_price}
                     processed += 1
@@ -515,12 +475,10 @@ def scan_and_trade():
                 except Exception as e:
                     print(f"Error scanning {symbol}: {e}")
                     continue
-            # تأخير بين الدفعات
             if batch_start + BATCH_SIZE < len(all_symbols):
                 time.sleep(BATCH_DELAY)
             send_telegram(f"📊 Batch {batch_start//BATCH_SIZE +1}/{total_batches} | Processed {processed}/{len(all_symbols)} | Candidates: {len(candidates)}")
 
-        # ترتيب المرشحين وفتح الصفقات
         candidates.sort(key=lambda x: x[2], reverse=True)
         if candidates:
             msg = "📊 Top candidates:\n"
@@ -537,7 +495,7 @@ def scan_and_trade():
     finally:
         scanning = False
 
-# ================== AUTO SCAN SCHEDULER ==================
+# ================== AUTO LOOPS ==================
 def auto_scan_loop():
     while True:
         now = datetime.now()
@@ -580,13 +538,13 @@ class WebHandler(BaseHTTPRequestHandler):
         html = f"""
         <html><head><title>Gate.io Pro Bot</title><meta http-equiv="refresh" content="30"></head>
         <body style="background:#1a1a2e;color:#eee;font-family:Segoe UI;text-align:center;padding:20px">
-        <h1>🚀 Gate.io Pro Bot (Multi-Timeframe)</h1>
+        <h1>🚀 Gate.io Pro Bot</h1>
         <p>Status: ✅ ONLINE | Uptime: {uptime:.1f}h</p>
         <p>💰 Balance: ${status['balance']:.2f} | 📈 Total PnL: ${status['total_pnl']:+.2f}</p>
         <p>🟢 Open: {status['open_trades']} | 🔒 Closed: {status['closed_trades']} | 📊 Win Rate: {status['win_rate']:.1f}%</p>
         <p>⚠️ Daily Loss: ${status['daily_loss']:.2f} / ${DAILY_LOSS_LIMIT}</p>
         <p>📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-        <hr><p>🤖 Scan 1200 symbols | Pre-filter + Multi-TF score | Dynamic entry & TP/SL</p>
+        <hr><p>🤖 Auto-scan every 15 min | Multi-TF | Dynamic entry & TP/SL</p>
         </body></html>
         """
         self.wfile.write(html.encode())
@@ -653,10 +611,9 @@ def handle_commands():
 # ================== MAIN ==================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 GATE.IO PRO BOT - FILTERING PIPELINE + MULTI-TIMEFRAME")
+    print("🚀 GATE.IO PRO BOT STARTED")
     print(f"Mode: {'TESTNET' if USE_TESTNET else 'LIVE'}")
-    print(f"Scan 1200 symbols | Batch size {BATCH_SIZE} | Pre-filter + Score")
-    print(f"TP: {PROFIT_TARGETS}% | Trailing: {TRAILING_STOP_DISTANCE}% | Breakeven: {BREAKEVEN_ACTIVATION}%")
+    print(f"Initial balance: ${INITIAL_BALANCE}")
     print("=" * 60)
 
     threading.Thread(target=start_web, daemon=True).start()
