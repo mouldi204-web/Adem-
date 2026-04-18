@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
+"""
+Gate.io Auto Trading Bot - No CCXT (Pure Python)
+"""
+
 import os
 import time
 import json
 import threading
 import urllib.request
-import ccxt
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# ================== SETTINGS ==================
 TELEGRAM_TOKEN = "8439548325:AAHOBBHy7EwcX3J5neIaf6iJuSjyGJCuZ68"
 TELEGRAM_CHAT_ID = "5067771509"
 
@@ -42,6 +46,7 @@ PRECONDITIONS = {
     'min_liquidity': 0.001,
 }
 
+# ================== GLOBALS ==================
 balance = INITIAL_BALANCE
 open_trades = {}
 closed_trades = []
@@ -55,10 +60,13 @@ daily_loss = 0
 last_reset_date = datetime.now().date()
 last_update_id = 0
 
-exchange = ccxt.gateio({'enableRateLimit': True, 'rateLimit': 1200, 'options': {'defaultType': 'spot'}})
+# Base URLs
 if USE_TESTNET:
-    exchange.set_sandbox_mode(True)
+    BASE_URL = "https://api-testnet.gateapi.io/api/v4"
+else:
+    BASE_URL = "https://api.gateio.ws/api/v4"
 
+# ================== TELEGRAM ==================
 def send_telegram(text, chat_id=None):
     target = chat_id or TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -69,42 +77,65 @@ def send_telegram(text, chat_id=None):
     except Exception as e:
         print("Telegram error:", e)
 
-def get_price(symbol):
+# ================== API HELPERS ==================
+def http_get(endpoint):
     try:
-        ticker = exchange.fetch_ticker(f"{symbol}/USDT")
-        return ticker['last']
-    except:
-        return 0
-
-def get_24h_data(symbol):
-    try:
-        ticker = exchange.fetch_ticker(f"{symbol}/USDT")
-        return {
-            'price': ticker['last'],
-            'change': ticker.get('percentage', 0),
-            'volume': ticker.get('quoteVolume', 0),
-            'high': ticker.get('high', 0),
-            'low': ticker.get('low', 0),
-            'bid': ticker.get('bid', 0),
-            'ask': ticker.get('ask', 0),
-        }
-    except:
+        url = f"{BASE_URL}{endpoint}"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"HTTP GET error {endpoint}: {e}")
         return None
 
 def get_all_symbols():
-    try:
-        markets = exchange.load_markets()
-        symbols = [s.replace('/USDT', '') for s in markets if s.endswith('/USDT')]
-        return [s for s in symbols if s not in STABLE_COINS][:MAX_SYMBOLS]
-    except:
+    """جلب قائمة جميع العملات المتاحة (تلك التي لها زوج مع USDT)"""
+    data = http_get("/spot/currency_pairs")
+    if not data:
         return []
+    symbols = []
+    for pair in data:
+        if pair['quote'] == 'USDT' and pair['trade_status'] == 'tradable':
+            base = pair['base']
+            if base not in STABLE_COINS:
+                symbols.append(base)
+    return symbols[:MAX_SYMBOLS]
 
-def fetch_ohlcv(symbol, timeframe='1h', limit=100):
-    try:
-        return exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe=timeframe, limit=limit)
-    except:
+def get_ticker_24h(symbol):
+    """جلب بيانات التيكر لـ 24 ساعة"""
+    data = http_get(f"/spot/tickers?currency_pair={symbol}_USDT")
+    if data and len(data) > 0:
+        t = data[0]
+        return {
+            'price': float(t['last']),
+            'change': float(t.get('change_percentage', 0)),
+            'volume': float(t.get('quote_volume', 0)),
+            'high': float(t.get('high_24h', 0)),
+            'low': float(t.get('low_24h', 0)),
+            'bid': float(t.get('highest_bid', 0)),
+            'ask': float(t.get('lowest_ask', 0)),
+        }
+    return None
+
+def fetch_ohlcv(symbol, interval='1h', limit=100):
+    """جلب بيانات الشموع (OHLCV)"""
+    endpoint = f"/spot/candlesticks?currency_pair={symbol}_USDT&interval={interval}&limit={limit}"
+    data = http_get(endpoint)
+    if not data:
         return []
+    ohlcv = []
+    for c in data:
+        # c: [timestamp, volume, close, high, low, open] حسب وثائق Gate.io
+        # نعيد ترتيبها إلى [timestamp, open, high, low, close, volume]
+        ts = int(c[0])
+        o = float(c[5])
+        h = float(c[3])
+        l = float(c[4])
+        cl = float(c[2])
+        v = float(c[1])
+        ohlcv.append([ts, o, h, l, cl, v])
+    return ohlcv
 
+# ================== TECHNICAL INDICATORS (pure python) ==================
 def calculate_rsi(ohlcv, period=14):
     closes = [c[4] for c in ohlcv]
     if len(closes) < period + 1:
@@ -175,6 +206,7 @@ def calculate_atr(ohlcv, period=14):
         tr_values.append(tr)
     return sum(tr_values[-period:]) / period
 
+# ================== PRECISE ENTRY & TP/SL ==================
 def calculate_precise_entry(current_price, ohlcv_1h, ohlcv_4h):
     support_1h, _ = get_support_resistance(ohlcv_1h, current_price)
     support_4h, _ = get_support_resistance(ohlcv_4h, current_price)
@@ -202,6 +234,7 @@ def calculate_dynamic_tp_sl(entry_price, atr, support, resistance):
     tp3 = entry_price * 1.10
     return [tp1, tp2, tp3], sl_price
 
+# ================== SCORING ==================
 def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, coin_win_rate):
     score = 0
     price = ticker_data['price']
@@ -209,28 +242,33 @@ def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, 
     volume = ticker_data['volume']
     high = ticker_data['high']
     low = ticker_data['low']
+
     if change > 10: score += 15
     elif change > 8: score += 12
     elif change > 6: score += 9
     elif change > 4: score += 6
     elif change > 2: score += 3
     elif change > 1: score += 1
+
     if volume > 200_000_000: score += 10
     elif volume > 100_000_000: score += 8
     elif volume > 50_000_000: score += 6
     elif volume > 20_000_000: score += 4
     elif volume > 10_000_000: score += 2
+
     if price < 0.05: score += 8
     elif price < 0.1: score += 6
     elif price < 0.5: score += 4
     elif price < 1: score += 2
     elif price < 2: score += 1
+
     if high > 0 and low > 0:
         volatility = ((high - low) / low) * 100
         if 5 <= volatility <= MAX_VOLATILITY:
             score += 5
         elif volatility > MAX_VOLATILITY:
             score -= 5
+
     if ohlcv_1h and len(ohlcv_1h) >= 20:
         volumes = [c[5] for c in ohlcv_1h[-21:-1]]
         avg_vol = sum(volumes) / len(volumes) if volumes else 1
@@ -238,33 +276,42 @@ def calculate_score_mtf(ticker_data, ohlcv_15m, ohlcv_1h, ohlcv_4h, btc_change, 
         if vol_ratio > 2: score += 5
         elif vol_ratio > 1.5: score += 3
         elif vol_ratio > 1.2: score += 1
+
     trend_15m = get_trend(ohlcv_15m)
     trend_1h = get_trend(ohlcv_1h)
     trend_4h = get_trend(ohlcv_4h)
     bullish_count = sum([1 for t in [trend_15m, trend_1h, trend_4h] if t == 1])
     if bullish_count >= 2: score += 10
     elif bullish_count == 1: score += 5
+
     if ohlcv_1h and len(ohlcv_1h) >= 15:
         rsi = calculate_rsi(ohlcv_1h)
         if 30 <= rsi <= 50: score += 5
         elif rsi > 70: score -= 5
+
     if ohlcv_1h and len(ohlcv_1h) >= 26:
         macd, _ = calculate_macd(ohlcv_1h)
         if macd > 0: score += 5
+
     if ohlcv_1h and len(ohlcv_1h) >= 20:
         if calculate_bb_width(ohlcv_1h) < 0.05: score += 3
+
     if coin_win_rate is not None:
         if coin_win_rate > 70: score += 4
         elif coin_win_rate > 60: score += 2
         elif coin_win_rate > 50: score += 1
+
     if btc_change is not None:
         if btc_change < -2: score = score * 0.7
         elif btc_change > 2: score = score * 1.1
+
     hour = datetime.now().hour
     if hour < ACTIVE_HOURS_START or hour > ACTIVE_HOURS_END:
         score = score * 0.8
+
     return max(0, min(100, int(score)))
 
+# ================== TRADING LOGIC ==================
 def get_position_size(score, volatility=None):
     base = 50
     if score >= 90: size = base * 1.5
@@ -342,6 +389,10 @@ def close_trade(symbol, reason, close_percent=1.0):
         if symbol in trailing: del trailing[symbol]
     return True
 
+def get_price(symbol):
+    ticker = get_ticker_24h(symbol)
+    return ticker['price'] if ticker else 0
+
 def monitor_trades():
     for sym in list(open_trades.keys()):
         cur = get_price(sym)
@@ -376,6 +427,7 @@ def monitor_trades():
                 elif cur > trade['highest']:
                     trailing[sym] = cur * (1 - TRAILING_STOP_DISTANCE / 100)
 
+# ================== FILTERING PIPELINE & SCAN ==================
 def passes_prefilter(symbol, ticker_data):
     price = ticker_data['price']
     change = ticker_data['change']
@@ -383,18 +435,18 @@ def passes_prefilter(symbol, ticker_data):
     bid = ticker_data.get('bid', price)
     ask = ticker_data.get('ask', price)
     if price < PRECONDITIONS['min_price']:
-        return False, f"price {price:.4f} < {PRECONDITIONS['min_price']}"
+        return False
     if volume < PRECONDITIONS['min_volume']:
-        return False, f"volume {volume/1e6:.1f}M < {PRECONDITIONS['min_volume']/1e6}M"
+        return False
     if change < PRECONDITIONS['min_change']:
-        return False, f"change {change:.1f}% < {PRECONDITIONS['min_change']}%"
+        return False
     if change > PRECONDITIONS['max_change']:
-        return False, f"change {change:.1f}% > {PRECONDITIONS['max_change']}%"
+        return False
     if bid > 0 and ask > 0:
         spread = (ask - bid) / bid
         if spread > PRECONDITIONS['min_liquidity']:
-            return False, f"spread {spread:.2%} > {PRECONDITIONS['min_liquidity']:.1%}"
-    return True, "OK"
+            return False
+    return True
 
 def scan_and_trade():
     global scanning, detected_coins
@@ -409,19 +461,19 @@ def scan_and_trade():
             send_telegram("Failed to fetch symbols.")
             scanning = False
             return
-        btc_data = get_24h_data('BTC')
-        btc_change = btc_data['change'] if btc_data else 0
+        btc_ticker = get_ticker_24h('BTC')
+        btc_change = btc_ticker['change'] if btc_ticker else 0
         candidates = []
         total_batches = (len(all_symbols) + BATCH_SIZE - 1) // BATCH_SIZE
         processed = 0
+
         for batch_start in range(0, len(all_symbols), BATCH_SIZE):
             batch = all_symbols[batch_start:batch_start+BATCH_SIZE]
             for symbol in batch:
                 try:
-                    ticker_data = get_24h_data(symbol)
+                    ticker_data = get_ticker_24h(symbol)
                     if not ticker_data: continue
-                    passed, _ = passes_prefilter(symbol, ticker_data)
-                    if not passed: continue
+                    if not passes_prefilter(symbol, ticker_data): continue
                     ohlcv_15m = fetch_ohlcv(symbol, '15m', 100)
                     ohlcv_1h = fetch_ohlcv(symbol, '1h', 100)
                     ohlcv_4h = fetch_ohlcv(symbol, '4h', 100)
@@ -445,6 +497,7 @@ def scan_and_trade():
             if batch_start + BATCH_SIZE < len(all_symbols):
                 time.sleep(BATCH_DELAY)
             send_telegram(f"📊 Batch {batch_start//BATCH_SIZE +1}/{total_batches} | Processed {processed}/{len(all_symbols)} | Candidates: {len(candidates)}")
+
         candidates.sort(key=lambda x: x[2], reverse=True)
         if candidates:
             msg = "📊 Top candidates:\n"
@@ -461,6 +514,7 @@ def scan_and_trade():
     finally:
         scanning = False
 
+# ================== AUTO LOOPS ==================
 def auto_scan_loop():
     while True:
         now = datetime.now()
@@ -475,6 +529,7 @@ def monitor_loop():
         monitor_trades()
         time.sleep(30)
 
+# ================== WEB DASHBOARD ==================
 def get_portfolio_status():
     total_value = balance
     for trade in open_trades.values():
@@ -486,10 +541,15 @@ def get_portfolio_status():
     winning = sum(1 for t in closed_trades if t.get('final_return', 0) > 0)
     win_rate = (winning / len(closed_trades) * 100) if closed_trades else 0
     return {
-        'balance': balance, 'total_value': total_value, 'total_pnl': total_pnl,
-        'return_pct': (total_pnl / INITIAL_BALANCE) * 100, 'open_trades': len(open_trades),
-        'closed_trades': len(closed_trades), 'win_rate': win_rate,
-        'daily_loss': daily_loss, 'daily_limit': DAILY_LOSS_LIMIT
+        'balance': balance,
+        'total_value': total_value,
+        'total_pnl': total_pnl,
+        'return_pct': (total_pnl / INITIAL_BALANCE) * 100,
+        'open_trades': len(open_trades),
+        'closed_trades': len(closed_trades),
+        'win_rate': win_rate,
+        'daily_loss': daily_loss,
+        'daily_limit': DAILY_LOSS_LIMIT
     }
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -518,9 +578,11 @@ def start_web():
     port = int(os.environ.get('PORT', 8080))
     HTTPServer(('0.0.0.0', port), WebHandler).serve_forever()
 
+# ================== TELEGRAM COMMANDS ==================
 def get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    if offset: url += f"?offset={offset}"
+    if offset:
+        url += f"?offset={offset}"
     try:
         with urllib.request.urlopen(url, timeout=30) as r:
             return json.loads(r.read().decode())
@@ -571,12 +633,14 @@ def handle_commands():
             print("Cmd error:", e)
             time.sleep(5)
 
+# ================== MAIN ==================
 if __name__ == "__main__":
     print("=" * 60)
-    print("🚀 GATE.IO PRO BOT STARTED")
+    print("🚀 GATE.IO PRO BOT STARTED (NO CCXT)")
     print(f"Mode: {'TESTNET' if USE_TESTNET else 'LIVE'}")
     print(f"Initial balance: ${INITIAL_BALANCE}")
     print("=" * 60)
+
     threading.Thread(target=start_web, daemon=True).start()
     threading.Thread(target=auto_scan_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
