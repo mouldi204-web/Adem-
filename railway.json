@@ -1,13 +1,4 @@
-{
-  "build": {
-    "builder": "NIXPACKS",
-    "buildCommand": "pip install -r requirements.txt"
-  },
-  "deploy": {
-    "startCommand": "python main.py",
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10,
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 300
-  }
-}
+FROM python:3.9-slim
+WORKDIR /app
+COPY main.py .
+CMD ["python", "main.py"]
