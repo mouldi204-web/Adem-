@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: binance-trading-bot
+    runtime: python
+    buildCommand: ""
+    startCommand: python main.py
+    envVars:
+      - key: PORT
+        value: 8080
+    plan: free
